@@ -1,0 +1,8 @@
+**/node_modules
+**/dist
+**/dist-worker
+**/.env
+.git
+.claude
+apps/api/src/generated
+promt.txt

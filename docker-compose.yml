@@ -1,0 +1,73 @@
+# Educational flash-sale demo.
+#
+#   docker compose up --build        -> everything (postgres, redis, api, worker, dashboard on :3000)
+#   docker compose up -d postgres redis   (or: npm run infra) -> only infrastructure, for `npm run dev`
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: flashsale
+      POSTGRES_PASSWORD: flashsale
+      POSTGRES_DB: flashsale
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres-init.sql:/docker-entrypoint-initdb.d/01-test-db.sql:ro
+    # Allow enough connections for API pool + worker pool + tests.
+    command: ["postgres", "-c", "max_connections=200"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flashsale -d flashsale"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    # appendonly gives Redis an append-only file (closer to what you'd run in production).
+    # The "Simulate Redis data loss" button still wipes keys explicitly so you can observe the failure.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    restart: unless-stopped
+    command: ["sh", "-c", "npx prisma migrate deploy && node dist/main.js"]
+    environment:
+      DATABASE_URL: postgresql://flashsale:flashsale@postgres:5432/flashsale
+      REDIS_URL: redis://redis:6379
+      PORT: "3000"
+      WEB_DIST: /app/apps/web/dist
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  worker:
+    build: .
+    # If the worker dies, persistence silently stops (requests still get 202): always bring it back.
+    restart: unless-stopped
+    command: ["node", "dist/worker.main.js"]
+    environment:
+      DATABASE_URL: postgresql://flashsale:flashsale@postgres:5432/flashsale
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:

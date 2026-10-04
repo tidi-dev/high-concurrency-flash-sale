@@ -1,0 +1,51 @@
+{
+  "name": "@flash/api",
+  "private": true,
+  "version": "1.0.0",
+  "description": "NestJS API + BullMQ worker for the flash-sale demo",
+  "scripts": {
+    "build": "prisma generate && nest build",
+    "dev:api": "nest start --watch --preserveWatchOutput",
+    "dev:worker": "nest start --watch --preserveWatchOutput --entryFile worker.main -p tsconfig.worker.json",
+    "start": "node dist/main.js",
+    "start:worker": "node dist/worker.main.js",
+    "db:migrate": "prisma migrate deploy && prisma generate",
+    "db:migrate:dev": "prisma migrate dev",
+    "pretest": "prisma generate",
+    "test": "jest --selectProjects unit",
+    "test:integration": "jest --selectProjects integration --runInBand",
+    "test:all": "jest --runInBand",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "load": "tsx scripts/load.ts",
+    "reset": "tsx scripts/reset.ts"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.2.7",
+    "@nestjs/core": "^11.2.7",
+    "@nestjs/platform-express": "^11.2.7",
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "bullmq": "^6.3.11",
+    "dotenv": "^17.4.2",
+    "ioredis": "^5.11.1",
+    "pg": "^8.16.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "undici": "^8.11.2"
+  },
+  "devDependencies": {
+    "@flash/shared": "*",
+    "@nestjs/cli": "^11.0.24",
+    "@nestjs/testing": "^11.2.7",
+    "@types/express": "^5.0.6",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.15.0",
+    "@types/supertest": "^6.0.3",
+    "jest": "^30.5.2",
+    "prisma": "^7.10.0",
+    "supertest": "^7.3.1",
+    "ts-jest": "^29.4.14",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3"
+  }
+}

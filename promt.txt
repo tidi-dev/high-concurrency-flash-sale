@@ -1,0 +1,728 @@
+You are a senior backend/distributed-systems engineer and technical educator.
+
+I want you to build an educational demo that explains and visualizes how a high-concurrency flash-sale system can prevent overselling.
+
+## Problem context
+
+Imagine a flash sale starting at 12 PM:
+
+- Product stock: 500 units
+- Potential buyers: up to 2,000,000 concurrent Buy requests
+- A naive implementation does:
+
+  1. SELECT stock from PostgreSQL
+  2. Check stock > 0
+  3. UPDATE stock
+  4. Create order
+
+At very high concurrency this can cause severe database contention, poor latency, and—if implemented without proper atomic/transactional safeguards—overselling.
+
+The architecture we want to explore is approximately:
+
+Browser
+    ↓
+API
+    ↓
+Redis atomic reservation
+    ↓
+Allowed / Sold Out
+    ↓
+Queue
+    ↓
+Worker
+    ↓
+PostgreSQL
+
+Redis contains the fast-path inventory reservation.
+
+Conceptually:
+
+stock = DECR flash:product:stock
+
+if stock >= 0:
+    ALLOW
+else:
+    INCR flash:product:stock
+    SOLD_OUT
+
+Successful reservations are queued for asynchronous processing.
+
+The user receives something similar to:
+
+"Reserved for 10 minutes. Complete payment before the reservation expires."
+
+A worker consumes the queue and persists orders/reservations to PostgreSQL.
+
+If the reservation expires without payment, inventory should eventually become available again.
+
+The demo must also explain that Redis atomicity alone does NOT magically solve every distributed-system problem.
+
+---
+
+# Phase 1 — Research and development workflow setup
+
+BEFORE building the application, inspect:
+
+https://github.com/obra/superpowers
+
+Determine the CURRENT recommended installation method for Claude Code from the repository documentation.
+
+Set up Superpowers appropriately for this project.
+
+IMPORTANT:
+
+Do NOT blindly download/install every skill, agent, plugin, or workflow you find.
+
+Use only the parts that are relevant to this project.
+
+Prefer capabilities related to:
+
+- brainstorming / design
+- implementation planning
+- test-driven development
+- systematic debugging
+- subagent-driven development where useful
+- code review
+- verification before completion
+
+If Superpowers automatically provides these capabilities through its plugin, use that mechanism instead of copying redundant skills into the repository.
+
+Document what you installed/enabled and why.
+
+Do not install unrelated agents or skills.
+
+---
+
+# Phase 2 — Analyze the problem before coding
+
+Before writing application code, analyze the architecture.
+
+Explain:
+
+1. Why the naive PostgreSQL implementation is problematic under extreme contention.
+2. Why a naive SELECT-then-UPDATE implementation can oversell.
+3. How proper PostgreSQL transactions/locking/atomic UPDATEs could prevent overselling, but may become a bottleneck at flash-sale scale.
+4. Why Redis is useful as a fast admission/reservation layer.
+5. Why Redis DECR is atomic.
+6. When Lua is actually needed versus plain Redis atomic commands.
+7. Why a queue helps isolate checkout/order persistence from the request spike.
+8. Why the database remains the durable source of truth.
+9. What happens if Redis crashes.
+10. What happens if the API crashes after Redis reservation but before queue publication.
+11. What happens if a queue message is delivered twice.
+12. How reservation expiration should work.
+13. Why idempotency is necessary.
+14. How Redis and PostgreSQL can become inconsistent.
+15. What production systems might do to mitigate these failure modes.
+
+Do not simply assume the interview answer is completely correct.
+
+Point out oversimplifications and design the demo so I can experimentally observe them.
+
+Create an architecture/design document before implementation.
+
+---
+
+# Phase 3 — Technology stack
+
+Prefer TypeScript.
+
+Use:
+
+Backend:
+- NestJS
+- Prisma
+- PostgreSQL
+- Redis
+
+Queue:
+Prefer BullMQ + Redis for the local educational demo unless there is a compelling reason Kafka materially improves the learning objective.
+
+Explain the choice.
+
+The original interview example mentions Kafka, so document how BullMQ maps conceptually to Kafka and what would change in a real large-scale architecture.
+
+Frontend:
+- Next.js or React
+- TypeScript
+
+Infrastructure:
+- Docker Compose
+
+Testing/load generation:
+Choose a simple tool such as:
+- k6
+- autocannon
+- custom Node.js load generator
+
+Choose whichever makes the demo easiest to run and understand.
+
+Avoid unnecessary infrastructure.
+
+This is an educational local demo, not a production ecommerce platform.
+
+---
+
+# Phase 4 — Build TWO implementations
+
+This is important.
+
+I want to visually compare the bad/naive approach against the improved architecture.
+
+## Mode A — Naive database implementation
+
+Create an intentionally naive endpoint approximately like:
+
+POST /naive/buy
+
+Flow:
+
+request
+→ read PostgreSQL stock
+→ check stock
+→ update stock
+→ create order
+
+Make the race condition observable.
+
+You may introduce a configurable artificial delay between SELECT and UPDATE so concurrency problems are easy to reproduce locally.
+
+Track:
+
+- requests
+- successes
+- failures
+- DB queries
+- oversold quantity
+- latency
+- final DB stock
+
+Clearly mark this endpoint as intentionally unsafe and educational.
+
+## Mode B — Redis reservation implementation
+
+Create:
+
+POST /flash-sale/buy
+
+Flow:
+
+request
+→ Redis atomic reservation
+→ immediate ALLOWED or SOLD_OUT response
+→ enqueue successful reservation
+→ worker processes reservation/order
+→ PostgreSQL persistence
+
+Use a unique request/order/reservation ID.
+
+Make processing idempotent.
+
+Stock must never become negative from successful reservations.
+
+---
+
+# Phase 5 — Reservation lifecycle
+
+Implement a simple reservation state machine:
+
+AVAILABLE
+→ RESERVED
+→ PAID
+
+or
+
+RESERVED
+→ EXPIRED
+→ inventory returned
+
+A reservation should have an expiration time.
+
+For the demo, make TTL configurable, for example:
+
+30 seconds
+
+instead of requiring 10 real minutes.
+
+Provide APIs/actions to:
+
+- reserve
+- simulate payment
+- expire reservation
+- release stock
+- inspect reservation state
+
+Make expiration safe against duplicate execution.
+
+Do not allow stock to be incremented twice for the same expired reservation.
+
+---
+
+# Phase 6 — Frontend visualization
+
+Build a dashboard specifically for learning.
+
+I should be able to understand the architecture without reading backend logs.
+
+Show:
+
+### Product
+
+Product name
+
+Initial stock:
+500
+
+Redis available stock:
+500
+
+PostgreSQL stock:
+500
+
+Reserved:
+0
+
+Paid:
+0
+
+Expired:
+0
+
+Queue depth:
+0
+
+### Simulation controls
+
+Buttons/inputs such as:
+
+Reset Demo
+
+Run Naive Test
+
+Run Redis Test
+
+Concurrent users:
+[100] [500] [1,000] [10,000]
+
+Initial stock:
+[500]
+
+Artificial DB delay:
+[0–100ms]
+
+Reservation TTL:
+[30 sec]
+
+Requests do NOT literally need to reach 2 million from my laptop.
+
+Allow smaller simulations that demonstrate the same concurrency behavior.
+
+Optionally provide a separate CLI load-test configuration capable of much higher load.
+
+### Live metrics
+
+Display:
+
+Total Requests
+Allowed
+Sold Out
+Orders Created
+Reservations
+Paid
+Expired
+Queue Depth
+Redis Stock
+DB Stock
+Errors
+Average Latency
+P95 Latency
+P99 Latency
+
+### Architecture visualization
+
+Show a simple live pipeline:
+
+Users
+  ↓
+NestJS API
+  ↓
+Redis
+  ↓
+Queue
+  ↓
+Worker
+  ↓
+PostgreSQL
+
+Animate/update counters as requests flow through the components.
+
+For the naive mode show:
+
+Users
+  ↓
+NestJS
+  ↓
+PostgreSQL
+
+and make contention/race effects visible.
+
+---
+
+# Phase 7 — Failure simulation
+
+Add simple developer/demo controls where practical.
+
+Examples:
+
+Pause Worker
+
+Resume Worker
+
+Simulate Slow Worker
+
+Simulate duplicate queue delivery
+
+Simulate API failure after Redis reservation
+
+Expire reservations
+
+Restart/reset Redis state
+
+The purpose is educational.
+
+I want to observe:
+
+Redis reservation succeeded
+        ↓
+queue publication failed
+        ↓
+what happens?
+
+and:
+
+queue message
+        ↓
+worker processes it twice
+        ↓
+does idempotency prevent duplicate orders?
+
+Do not build an unnecessarily complicated chaos-engineering framework.
+
+---
+
+# Phase 8 — Database model
+
+Design appropriate Prisma models.
+
+Likely entities:
+
+Product
+Order
+Reservation
+
+Potential fields:
+
+Product:
+- id
+- name
+- initialStock
+- stock
+- createdAt
+- updatedAt
+
+Reservation:
+- id
+- productId
+- status
+- expiresAt
+- createdAt
+- updatedAt
+
+Order:
+- id
+- reservationId
+- productId
+- status
+- createdAt
+
+Use unique constraints where appropriate to enforce idempotency.
+
+Do not blindly follow this schema if you see a cleaner design.
+
+Explain important constraints.
+
+---
+
+# Phase 9 — Redis keys
+
+Use understandable keys, for example:
+
+flash:{productId}:stock
+
+flash:{productId}:reservation:{reservationId}
+
+Document:
+
+- purpose
+- value
+- TTL
+- lifecycle
+
+Keep Redis usage simple enough for a beginner to inspect with redis-cli.
+
+---
+
+# Phase 10 — Observability
+
+Provide structured logging.
+
+Useful log events:
+
+RESERVATION_ALLOWED
+SOLD_OUT
+ORDER_QUEUED
+ORDER_CREATED
+PAYMENT_COMPLETED
+RESERVATION_EXPIRED
+STOCK_RELEASED
+DUPLICATE_MESSAGE_IGNORED
+
+Make the frontend capable of showing a small live event stream if reasonably simple.
+
+Use WebSocket or Server-Sent Events if appropriate.
+
+Prefer the simpler option.
+
+---
+
+# Phase 11 — Tests
+
+Write meaningful tests.
+
+At minimum:
+
+Unit tests:
+- Redis reservation logic
+- stock release
+- expiration
+- idempotency
+
+Integration tests:
+- successful reservation
+- sold out
+- concurrent reservation attempts
+- duplicate worker messages
+- expiration restores stock
+
+Critical invariant test:
+
+Given:
+
+initial stock = 500
+
+and:
+
+N concurrent reservation attempts where N > 500
+
+assert:
+
+successful reservations <= 500
+
+and:
+
+Redis stock >= 0
+
+and after processing:
+
+paid + active reservations <= 500
+
+Also demonstrate through a test/load scenario how the intentionally naive implementation can fail.
+
+---
+
+# Phase 12 — Developer experience
+
+The entire project should run locally with as few commands as possible.
+
+Target experience:
+
+docker compose up -d
+
+npm install
+
+npm run dev
+
+or ideally:
+
+docker compose up --build
+
+Provide scripts such as:
+
+npm run dev
+npm run test
+npm run test:integration
+npm run load:naive
+npm run load:redis
+npm run reset
+
+Use a monorepo structure if helpful, for example:
+
+apps/
+  api/
+  web/
+  worker/
+
+packages/
+  shared/
+
+prisma/
+
+docs/
+
+docker-compose.yml
+
+README.md
+
+Choose the simplest maintainable structure.
+
+---
+
+# Phase 13 — Teaching material
+
+This project is for learning distributed systems, not merely producing code.
+
+Create:
+
+docs/
+  01-problem.md
+  02-naive-solution.md
+  03-redis-atomicity.md
+  04-queue.md
+  05-reservations.md
+  06-idempotency.md
+  07-failure-modes.md
+  08-production-considerations.md
+  09-interview-answer.md
+
+Write these for someone who knows basic web development but is new to distributed systems.
+
+Use diagrams where useful.
+
+Explain terminology before using it heavily.
+
+In `09-interview-answer.md`, give me a polished version of how I should answer this system-design interview question.
+
+Include:
+
+- a 30-second answer
+- a 2-minute answer
+- deeper follow-up discussion
+- common interviewer follow-up questions
+- mistakes to avoid
+
+---
+
+# Phase 14 — README
+
+README should explain:
+
+## What this demo teaches
+
+## Architecture
+
+## Quick start
+
+## Naive implementation
+
+## Redis implementation
+
+## How to run a flash-sale simulation
+
+## How to observe overselling
+
+## How Redis prevents reservation oversell
+
+## Why the queue exists
+
+## Reservation expiration
+
+## Failure scenarios
+
+## Running tests
+
+## Running load tests
+
+## Project structure
+
+## Production limitations
+
+Include Mermaid diagrams where appropriate.
+
+---
+
+# Important engineering constraints
+
+Do NOT overengineer this.
+
+This is an educational demo.
+
+Prefer:
+
+simple
+observable
+testable
+easy to run
+easy to understand
+
+over:
+
+production-scale abstraction
+microservice explosion
+complex Kubernetes infrastructure
+unnecessary event sourcing
+unnecessary CQRS
+
+However, do not hide important distributed-system correctness issues just to make the demo look perfect.
+
+Explicitly distinguish:
+
+"safe enough for this demo"
+
+from:
+
+"what we would need in production."
+
+---
+
+# Execution workflow
+
+Follow this order:
+
+1. Read and understand this prompt completely.
+2. Inspect the current obra/superpowers repository/documentation.
+3. Install/configure Superpowers using its current Claude Code installation method.
+4. Do NOT install every available skill/agent.
+5. Identify only the capabilities relevant to this project and explain the selection.
+6. Analyze the flash-sale problem.
+7. Create architecture/design documentation.
+8. Create an implementation plan.
+9. Show the planned project structure.
+10. Implement incrementally.
+11. Write tests alongside implementation.
+12. Run the application.
+13. Run tests.
+14. Run a concurrency/load simulation.
+15. Fix discovered problems.
+16. Verify the important invariants.
+17. Finish the frontend visualization.
+18. Complete teaching documentation.
+19. Perform a final code review.
+20. Provide a concise final report.
+
+Do not stop after scaffolding.
+
+Do not claim something works unless you actually ran the relevant command/test.
+
+If something cannot be run in the current environment, clearly state exactly what was not verified.
+
+When making architectural decisions, optimize for the educational objective: I should finish this project understanding WHY Redis, queues, reservations, TTLs, idempotency, and durable database state are used in flash-sale systems.

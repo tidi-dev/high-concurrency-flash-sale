@@ -1,0 +1,6 @@
+{
+  // Same compiler settings, separate output folder: `npm run dev` runs two `nest start --watch`
+  // processes (api + worker), and they must not delete each other's dist/ on rebuild.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "outDir": "./dist-worker" }
+}

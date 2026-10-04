@@ -1,0 +1,29 @@
+{
+  "name": "high-concurrency-flash-sale",
+  "private": true,
+  "description": "Educational demo: preventing oversell in a high-concurrency flash sale (naive PostgreSQL vs Redis reservation + queue)",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "infra": "docker compose up -d postgres redis",
+    "db:migrate": "npm run db:migrate -w apps/api",
+    "predev": "npm run db:migrate",
+    "dev": "concurrently -k -n api,worker,web -c blue,magenta,green \"npm run dev:api -w apps/api\" \"npm run dev:worker -w apps/api\" \"npm run dev -w apps/web\"",
+    "build": "npm run build -w apps/api && npm run build -w apps/web",
+    "test": "npm run test -w apps/api",
+    "test:integration": "npm run test:integration -w apps/api",
+    "test:all": "npm run test:all -w apps/api",
+    "load:naive": "npm run load -w apps/api -- --mode naive",
+    "load:redis": "npm run load -w apps/api -- --mode flash",
+    "reset": "npm run reset -w apps/api --",
+    "typecheck": "npm run typecheck -w apps/api && npm run typecheck -w apps/web"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.env
+*.log
+apps/api/src/generated/
+.DS_Store
+dist-worker/
+.claude/scheduled_tasks.lock
