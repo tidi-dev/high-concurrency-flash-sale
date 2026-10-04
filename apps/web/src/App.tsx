@@ -68,7 +68,7 @@ export function App() {
       {!s ? (
         <div className="card">Connecting to the API… (is it running on :3000?)</div>
       ) : tab === 'story' ? (
-        <StoryMode s={s} events={events} notify={notify} />
+        <StoryMode events={events} notify={notify} />
       ) : !s.flash.product ? (
         <div className="card">
           <ControlPanel s={s} notify={notify} />

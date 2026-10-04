@@ -1292,3 +1292,108 @@ td.ellipsis {
     animation: none;
   }
 }
+
+/* =================== story stepper =================== */
+.stepper {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.stepper-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.stepper-buttons .btn {
+  font-size: 14px;
+  padding: 8px 14px;
+}
+.stepper-buttons .play {
+  min-width: 96px;
+}
+.step-count {
+  margin-left: auto;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.step-count .waiting {
+  color: var(--muted);
+  animation: blink 1.4s ease-in-out infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0.35;
+  }
+}
+.scrubber {
+  width: 100%;
+  margin-top: 8px;
+}
+.stepper-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+.step-caption {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 15px;
+  padding: 10px 12px;
+  border-left: 4px solid var(--accent);
+  background: var(--code-bg);
+  border-radius: 6px;
+  margin-bottom: 14px;
+  animation: narr-in 0.35s ease-out;
+}
+.step-no {
+  flex: none;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  padding-top: 2px;
+}
+.token {
+  position: relative;
+}
+.tok-num {
+  position: absolute;
+  top: -4px;
+  right: -6px;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 999px;
+  background: var(--card);
+  border: 1px solid var(--border);
+}
+.token.focus .tok-face {
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px var(--accent);
+  animation: focus-pulse 1.2s ease-in-out infinite;
+}
+@keyframes focus-pulse {
+  50% {
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+}
+@media (max-width: 600px) {
+  .step-count {
+    margin-left: 0;
+    width: 100%;
+  }
+  .stepper-buttons .btn {
+    padding: 8px 10px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token.focus .tok-face,
+  .step-count .waiting,
+  .step-caption {
+    animation: none;
+  }
+}

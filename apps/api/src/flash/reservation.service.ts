@@ -47,15 +47,18 @@ export class ReservationService {
 
     let result: 'ALLOWED' | 'SOLD_OUT' | 'ALREADY_RESERVED' | 'NOT_INITIALIZED';
     let saleId = '';
+    let remaining = 0;
     let existingReservationId: string | undefined;
     if (cfg.reserveStrategy === 'lua') {
       const r = await this.scripts.reserve(input);
       result = r.result;
+      remaining = r.remaining;
       saleId = r.saleId ?? '';
       existingReservationId = r.existingReservationId;
     } else {
       const r = await this.scripts.reserveWithDecr(input);
       result = r.result;
+      remaining = r.remaining;
       saleId = r.saleId ?? '';
       if (r.compensated) {
         await this.scripts.recordMinObserved(r.observed);
@@ -74,7 +77,10 @@ export class ReservationService {
       return { status: result, reservationId: existingReservationId, message: MESSAGES[result](cfg.reservationTtlSec) };
     }
 
-    await this.telemetry.record({ type: 'RESERVATION_ALLOWED', mode: 'flash', reservationId, userId }, { hash: M, incr: { requests: 1, allowed: 1 } });
+    await this.telemetry.record(
+      { type: 'RESERVATION_ALLOWED', mode: 'flash', reservationId, userId, detail: `${remaining} left` },
+      { hash: M, incr: { requests: 1, allowed: 1 } },
+    );
 
     // ---- Failure simulation: the process dies between the two writes (Redis, then queue). ----
     if (cfg.crashAfterReservePercent > 0 && Math.random() * 100 < cfg.crashAfterReservePercent) {

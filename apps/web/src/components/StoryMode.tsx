@@ -1,20 +1,36 @@
-import type { DemoEvent, Mode, StateSnapshot, StoryRun, StorySpeed } from '@flash/shared';
-import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import type { DemoEvent, Mode, StoryRun, StorySpeed } from '@flash/shared';
+import { ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import { post } from '../api';
 
 const AVATARS = ['🧑', '👩', '👨', '🧓', '👧', '🧔', '👩‍🦱', '👨‍🦰', '👱‍♀️', '🧑‍🦱', '👵', '👦', '👩‍🦳', '🧑‍🦲', '👨‍🦳', '👱'];
 
 type Stage = 'door' | 'looked' | 'ordered' | 'soldout' | 'ticket' | 'queued' | 'processing' | 'saved' | 'rejected';
+type Playback = 'auto' | 'step';
 
 interface Shopper {
   id: string;
   n: number;
   avatar: string;
   stage: Stage;
-  /** Mode A: the stock value this shopper saw on the shelf. */
+  /** Shop A: the stock value this shopper saw on the shelf. */
   seen?: number;
   /** 1-based position among completed orders. */
   orderNo?: number;
+}
+
+/**
+ * One step of the story: the whole scene as it was right after one shopper did one thing.
+ * Every frame carries its own numbers, so going back in time shows the counts as they were.
+ */
+interface Frame {
+  shoppers: Record<string, Shopper>;
+  /** Shop A: the shelf count. Shop B: tickets left at the desk. */
+  count: number;
+  /** Shop A: orders written. Shop B: orders in the order book. */
+  orders: number;
+  caption: string;
+  /** The shopper this step is about (highlighted). */
+  focus?: string;
 }
 
 const STAGE_FROM_EVENT: Partial<Record<DemoEvent['type'], Stage>> = {
@@ -29,13 +45,89 @@ const STAGE_FROM_EVENT: Partial<Record<DemoEvent['type'], Stage>> = {
   RESERVATION_REJECTED: 'rejected',
 };
 
-// Never move a shopper backwards (events can arrive in the same tick out of order).
+// Never move a shopper backwards (e.g. the worker can report "picked" before the API reports "queued").
 const RANK: Record<Stage, number> = { door: 0, looked: 1, ticket: 1, queued: 2, processing: 3, ordered: 4, saved: 4, soldout: 4, rejected: 4 };
 
-export function StoryMode({ s, events, notify }: { s: StateSnapshot; events: DemoEvent[]; notify: (m: string, t?: 'ok' | 'danger') => void }) {
+const STEP_MS: Record<StorySpeed, number> = { slow: 1100, 'very-slow': 1900 };
+
+const num = (re: RegExp, text?: string): number | undefined => {
+  const m = re.exec(text ?? '');
+  return m ? Number(m[1]) : undefined;
+};
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** Applies one real event to the previous frame. Returns null if it doesn't change the picture. */
+function nextFrame(prev: Frame, e: DemoEvent): Frame | null {
+  const cur = prev.shoppers[e.userId ?? ''];
+  const stage = STAGE_FROM_EVENT[e.type];
+  if (!cur || !stage || RANK[stage] < RANK[cur.stage]) return null;
+  const p: Shopper = { ...cur, stage };
+  const name = `${cur.avatar} Shopper ${cur.n}`;
+  let { count, orders } = prev;
+  let caption: string;
+
+  switch (e.type) {
+    case 'NAIVE_STOCK_READ':
+      p.seen = num(/saw (-?\d+)/, e.detail);
+      caption = `${name} checks the shelf and sees ${plural(p.seen ?? 0, 'sneaker')}. "Yes, in stock!" But the order isn't written yet: there's a pause first.`;
+      break;
+    case 'NAIVE_ORDER_CREATED': {
+      orders += 1;
+      p.orderNo = orders;
+      count = num(/stock now (-?\d+)/, e.detail) ?? count - 1;
+      caption =
+        count >= 0
+          ? `${name}'s order is written, and the shelf count drops to ${count}.`
+          : `${name}'s order is written, and the shelf count drops to ${count}. This customer paid for a sneaker that doesn't exist!`;
+      break;
+    }
+    case 'NAIVE_SOLD_OUT':
+      caption = `${name} sees an empty shelf and leaves.`;
+      break;
+    case 'RESERVATION_ALLOWED':
+      count = num(/(-?\d+) left/, e.detail) ?? Math.max(0, count - 1);
+      caption = `${name} gets a ticket from the desk, instantly. ${plural(count, 'ticket')} left.`;
+      break;
+    case 'SOLD_OUT':
+      count = 0;
+      caption = `${name} asks for a ticket, but none are left. The answer "sold out" comes instantly.`;
+      break;
+    case 'ORDER_QUEUED':
+      caption = `${name} joins the waiting line. The paperwork happens in the back; nobody has to wait at the desk.`;
+      break;
+    case 'WORKER_PICKED':
+      caption = `The clerk picks up ${name}'s ticket and starts writing the order.`;
+      break;
+    case 'ORDER_CREATED':
+      orders += 1;
+      p.orderNo = orders;
+      caption = `${name}'s order is now in the official order book (order #${orders}).`;
+      break;
+    default:
+      caption = `${name}'s ticket was refused by the order book.`;
+  }
+  return { shoppers: { ...prev.shoppers, [p.id]: p }, count, orders, caption, focus: p.id };
+}
+
+function firstFrame(run: StoryRun): Frame {
+  const shoppers = Object.fromEntries(
+    run.shoppers.map((id, i) => [id, { id, n: i + 1, avatar: AVATARS[i % AVATARS.length], stage: 'door' as Stage }]),
+  );
+  return {
+    shoppers,
+    count: run.stock,
+    orders: 0,
+    caption: `The doors open: ${run.shoppers.length} shoppers want ${run.stock} sneakers. Press Next ▶ (or Play) to follow them.`,
+  };
+}
+
+export function StoryMode({ events, notify }: { events: DemoEvent[]; notify: (m: string, t?: 'ok' | 'danger') => void }) {
   const [speed, setSpeed] = useState<StorySpeed>('slow');
+  const [playback, setPlayback] = useState<Playback>('auto');
   const [run, setRun] = useState<StoryRun | null>(null);
-  const [shoppers, setShoppers] = useState<Record<string, Shopper>>({});
+  const [frames, setFrames] = useState<Frame[]>([]);
+  const [index, setIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
   // Event sequence numbers restart when a story resets the demo, so track what we've applied per run.
   const processed = useRef(new Set<number>());
 
@@ -46,44 +138,79 @@ export function StoryMode({ s, events, notify }: { s: StateSnapshot; events: Dem
       return;
     }
     processed.current = new Set();
-    setShoppers(Object.fromEntries(r.data.shoppers.map((id, i) => [id, { id, n: i + 1, avatar: AVATARS[i % AVATARS.length], stage: 'door' as Stage }])));
+    setFrames([firstFrame(r.data)]);
+    setIndex(0);
+    setPlaying(playback === 'auto');
     setRun(r.data);
   };
 
-  // Turn the live event stream into shopper movements.
+  // Record every real event for this run's shoppers as a new step.
   useEffect(() => {
     if (!run) return;
     const prefix = `story-${run.runId}-`;
-    const fresh = events.filter((e) => e.userId?.startsWith(prefix) && STAGE_FROM_EVENT[e.type]).sort((a, b) => a.seq - b.seq);
-    const newOnes = fresh.filter((e) => !processed.current.has(e.seq));
-    if (!newOnes.length) return;
-    for (const e of newOnes) processed.current.add(e.seq);
-    setShoppers((prev) => {
-      const next = { ...prev };
-      for (const e of newOnes) {
-        const cur = next[e.userId!];
-        const stage = STAGE_FROM_EVENT[e.type]!;
-        if (!cur || RANK[stage] < RANK[cur.stage]) continue;
-        const upd: Shopper = { ...cur, stage };
-        if (e.type === 'NAIVE_STOCK_READ') upd.seen = Number(/saw (-?\d+)/.exec(e.detail ?? '')?.[1]);
-        // Derived from state (not a ref) so React's dev double-invocation of updaters can't skip numbers.
-        if (stage === 'ordered' || stage === 'saved') upd.orderNo = Object.values(next).filter((x) => x.orderNo).length + 1;
-        next[e.userId!] = upd;
+    const fresh = events
+      .filter((e) => e.userId?.startsWith(prefix) && STAGE_FROM_EVENT[e.type] && !processed.current.has(e.seq))
+      .sort((a, b) => a.seq - b.seq);
+    if (!fresh.length) return;
+    for (const e of fresh) processed.current.add(e.seq);
+    setFrames((prev) => {
+      const out = [...prev];
+      for (const e of fresh) {
+        const f = nextFrame(out[out.length - 1], e);
+        if (f) out.push(f);
       }
-      return next;
+      return out;
     });
   }, [events, run]);
 
-  const list = useMemo(() => Object.values(shoppers).sort((a, b) => a.n - b.n), [shoppers]);
-  const at = (...stages: Stage[]) => list.filter((x) => stages.includes(x.stage));
+  const last = frames.length - 1;
+  const shown = Math.min(index, last);
+  const frame = frames[shown];
+  const finished = !!run && frames.length > 0 && isDone(frames[last], run.mode);
+
+  // Auto-play: a steady beat that shows each step for a moment, then moves on (or waits for new steps).
+  // `last` is read through a ref so new steps arriving don't restart the beat.
+  const lastRef = useRef(last);
+  lastRef.current = last;
+  useEffect(() => {
+    if (!playing) return;
+    const t = setInterval(() => setIndex((i) => Math.min(i + 1, lastRef.current)), STEP_MS[speed]);
+    return () => clearInterval(t);
+  }, [playing, speed]);
+
+  const go = useCallback(
+    (to: number) => {
+      setPlaying(false);
+      setIndex(Math.max(0, Math.min(to, last)));
+    },
+    [last],
+  );
+
+  // Keyboard: ← and → step through, space plays/pauses.
+  useEffect(() => {
+    if (!run) return;
+    const onKey = (ev: KeyboardEvent) => {
+      const tag = (ev.target as HTMLElement | null)?.tagName;
+      if (tag === 'SELECT' || tag === 'TEXTAREA' || (tag === 'INPUT' && (ev.target as HTMLInputElement).type !== 'range')) return;
+      if (ev.key === 'ArrowRight' || ev.key === 'ArrowLeft') {
+        ev.preventDefault(); // also stops the scrubber from moving a second time
+        go(shown + (ev.key === 'ArrowRight' ? 1 : -1));
+      } else if (ev.key === ' ' && tag !== 'BUTTON') {
+        ev.preventDefault();
+        setPlaying((p) => !p);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [run, shown, go]);
 
   return (
     <section className="story">
       <div className="card story-intro">
         <h2>🎬 Watch a flash sale in slow motion</h2>
         <p>
-          <b>10 shoppers</b> try to buy <b>5 limited sneakers</b> at the same moment. Pick a shop and press play. Everything you see is the
-          real system working; it has just been slowed down so you can follow each shopper.
+          <b>10 shoppers</b> try to buy <b>5 limited sneakers</b> at the same moment. Pick a shop and let it play, or go through it step by
+          step. Everything you see is the real system working; it has just been slowed down so you can follow each shopper.
         </p>
         <div className="story-buttons">
           <button className={`story-btn bad ${run?.mode === 'naive' ? 'current' : ''}`} onClick={() => start('naive')}>
@@ -101,6 +228,13 @@ export function StoryMode({ s, events, notify }: { s: StateSnapshot; events: Dem
             </span>
           </button>
           <label className="speed">
+            Playback
+            <select value={playback} onChange={(e) => setPlayback(e.target.value as Playback)}>
+              <option value="auto">Auto-play</option>
+              <option value="step">Step by step (I click Next)</option>
+            </select>
+          </label>
+          <label className="speed">
             Speed
             <select value={speed} onChange={(e) => setSpeed(e.target.value as StorySpeed)}>
               <option value="slow">Slow</option>
@@ -111,26 +245,105 @@ export function StoryMode({ s, events, notify }: { s: StateSnapshot; events: Dem
         <p className="hint">Starting a story resets the demo data. The 🔬 Lab tab runs the same code with thousands of shoppers.</p>
       </div>
 
-      {!run ? (
+      {!run || !frame ? (
         <div className="card story-empty">
           <div className="big-emoji">👟👟👟👟👟</div>
           <p>Choose Shop A or Shop B above to start.</p>
         </div>
-      ) : run.mode === 'naive' ? (
-        <NaiveScene s={s} run={run} list={list} at={at} />
       ) : (
-        <FlashScene s={s} run={run} list={list} at={at} />
+        <div className={`card scene ${run.mode === 'naive' ? 'scene-a' : 'scene-b'}`}>
+          {run.mode === 'naive' ? <NaivePhase frame={frame} run={run} /> : <FlashPhase frame={frame} run={run} />}
+          <Stepper
+            index={shown}
+            total={frames.length}
+            playing={playing}
+            waiting={!finished && shown >= last}
+            onFirst={() => go(0)}
+            onPrev={() => go(shown - 1)}
+            onNext={() => go(shown + 1)}
+            onLast={() => go(last)}
+            atFinish={finished && shown >= last}
+            onToggle={() => {
+              if (finished && shown >= last) {
+                setIndex(0); // replay from the start
+                setPlaying(true);
+              } else setPlaying((p) => !p);
+            }}
+            onSeek={go}
+          />
+          <div className="step-caption" key={`${run.runId}-${shown}`}>
+            <span className="step-no">Step {shown + 1}</span>
+            <span>{frame.caption}</span>
+          </div>
+          {run.mode === 'naive' ? <NaiveScene frame={frame} run={run} /> : <FlashScene frame={frame} run={run} />}
+        </div>
       )}
     </section>
   );
 }
 
-type At = (...stages: Stage[]) => Shopper[];
+function isDone(f: Frame, mode: Mode): boolean {
+  const open: Stage[] = mode === 'naive' ? ['door', 'looked'] : ['door', 'ticket', 'queued', 'processing'];
+  return Object.values(f.shoppers).every((p) => !open.includes(p.stage));
+}
 
-function Token({ p, label, tone }: { p: Shopper; label?: ReactNode; tone?: 'ok' | 'bad' | 'warn' }) {
+function Stepper(props: {
+  index: number;
+  total: number;
+  playing: boolean;
+  waiting: boolean;
+  atFinish: boolean;
+  onFirst: () => void;
+  onPrev: () => void;
+  onNext: () => void;
+  onLast: () => void;
+  onToggle: () => void;
+  onSeek: (i: number) => void;
+}) {
+  const atStart = props.index === 0;
+  const atEnd = props.index >= props.total - 1;
   return (
-    <span className={`token ${tone ? `tok-${tone}` : ''}`} title={`Shopper ${p.n}`}>
+    <div className="stepper">
+      <div className="stepper-buttons">
+        <button className="btn" onClick={props.onFirst} disabled={atStart} title="First step" aria-label="First step">
+          ⏮
+        </button>
+        <button className="btn" onClick={props.onPrev} disabled={atStart} title="Previous step (←)">
+          ◀ Previous
+        </button>
+        <button className="btn btn-primary play" onClick={props.onToggle} title="Play / pause (space)">
+          {props.atFinish ? '↺ Replay' : props.playing ? '⏸ Pause' : '▶ Play'}
+        </button>
+        <button className="btn" onClick={props.onNext} disabled={atEnd} title="Next step (→)">
+          Next ▶
+        </button>
+        <button className="btn" onClick={props.onLast} disabled={atEnd} title="Latest step" aria-label="Latest step">
+          ⏭
+        </button>
+        <span className="step-count">
+          Step <b>{props.index + 1}</b> of {props.total}
+          {props.waiting && <span className="waiting"> · waiting for the next thing to happen…</span>}
+        </span>
+      </div>
+      <input
+        className="scrubber"
+        type="range"
+        min={0}
+        max={Math.max(0, props.total - 1)}
+        value={props.index}
+        onChange={(e) => props.onSeek(Number(e.target.value))}
+        aria-label="Story step"
+      />
+      <div className="stepper-hint">Tip: ← and → step through, space plays or pauses.</div>
+    </div>
+  );
+}
+
+function Token({ p, label, tone, focus }: { p: Shopper; label?: ReactNode; tone?: 'ok' | 'bad' | 'warn'; focus?: boolean }) {
+  return (
+    <span className={`token ${tone ? `tok-${tone}` : ''} ${focus ? 'focus' : ''}`} title={`Shopper ${p.n}`}>
       <span className="tok-face">{p.avatar}</span>
+      <span className="tok-num">{p.n}</span>
       {label !== undefined && <span className="tok-label">{label}</span>}
     </span>
   );
@@ -178,60 +391,94 @@ function Shelf({ stock, initial, label }: { stock: number; initial: number; labe
     <div className="shelf">
       <div className="shelf-label">{label}</div>
       <div className="shelf-items">{items}</div>
-      <div className={`shelf-count ${stock < 0 ? 'neg' : ''}`}>{stock}</div>
+      <div className={`shelf-count ${stock < 0 ? 'neg' : ''}`} key={stock}>
+        {stock}
+      </div>
     </div>
   );
 }
 
-function NaiveScene({ s, run, list, at }: { s: StateSnapshot; run: StoryRun; list: Shopper[]; at: At }) {
-  const door = at('door');
-  const looked = at('looked');
-  const ordered = at('ordered').sort((a, b) => (a.orderNo ?? 0) - (b.orderNo ?? 0));
-  const soldout = at('soldout');
-  const stock = s.naive.product?.stock ?? run.stock;
-  const orders = s.naive.orders;
-  const done = list.length > 0 && door.length === 0 && looked.length === 0;
-  const oversold = Math.max(0, orders - run.stock);
-  const maxSeen = Math.max(...looked.map((x) => x.seen ?? 0), 0);
+const list = (f: Frame, ...stages: Stage[]) =>
+  Object.values(f.shoppers)
+    .filter((x) => stages.includes(x.stage))
+    .sort((a, b) => (a.orderNo ?? 0) - (b.orderNo ?? 0) || a.n - b.n);
 
-  let narr: { step: string; text: ReactNode; tone?: 'bad' | 'good' };
-  if (done) {
-    narr = oversold
-      ? { step: 'Result', tone: 'bad', text: <>😱 <b>{orders} orders for {run.stock} sneakers.</b> {oversold} customers paid for a sneaker that doesn't exist. This is <b>overselling</b>: every cashier checked the shelf <i>before</i> anyone took a sneaker, so every check said "yes".</> }
-      : { step: 'Result', tone: 'good', text: <>No overselling this time: {orders} orders for {run.stock} sneakers.</> };
-  } else if (ordered.length > 0) {
-    narr = { step: 'Step 3', tone: 'bad', text: <>✍️ Now the cashiers write their orders, each one taking a sneaker off the count… <b>the count keeps going, even below zero.</b></> };
-  } else if (looked.length > 0) {
-    narr = { step: 'Step 2', text: <>👀 Each cashier looks at the shelf and sees <b>{maxSeen} sneakers left</b>. Nobody has written an order yet, so <b>every check passes</b>. {looked.length} shoppers are now "approved" for the same {run.stock} sneakers…</> };
-  } else {
-    narr = { step: 'Step 1', text: <>🚪 The doors open. {list.length} shoppers rush in for {run.stock} sneakers. Each one gets a cashier.</> };
+/** The big "what's going on" sentence for the current phase of Shop A. */
+function NaivePhase({ frame, run }: { frame: Frame; run: StoryRun }) {
+  const looked = list(frame, 'looked');
+  const ordered = list(frame, 'ordered');
+  const oversold = Math.max(0, frame.orders - run.stock);
+  const maxSeen = Math.max(...looked.map((x) => x.seen ?? 0), 0);
+  if (isDone(frame, 'naive')) {
+    return oversold ? (
+      <Narration step="Result" tone="bad" text={<>😱 <b>{frame.orders} orders for {run.stock} sneakers.</b> {oversold} customers paid for a sneaker that doesn't exist. This is <b>overselling</b>: every cashier checked the shelf <i>before</i> anyone took a sneaker, so every check said "yes".</>} />
+    ) : (
+      <Narration step="Result" tone="good" text={<>No overselling this time: {frame.orders} orders for {run.stock} sneakers.</>} />
+    );
   }
+  if (ordered.length > 0) {
+    return <Narration step="Phase 3" tone="bad" text={<>✍️ Now the cashiers write their orders, each taking a sneaker off the count… <b>and the count keeps going, even below zero.</b></>} />;
+  }
+  if (looked.length > 0) {
+    return <Narration step="Phase 2" text={<>👀 The cashiers check the shelf and see <b>{maxSeen} sneakers left</b>. Nobody has written an order yet, so <b>every check passes</b>: {looked.length} shoppers are now "approved" for the same {run.stock} sneakers…</>} />;
+  }
+  return <Narration step="Phase 1" text={<>🚪 The doors open. {Object.keys(frame.shoppers).length} shoppers rush in for {run.stock} sneakers. Each one gets a cashier.</>} />;
+}
+
+/** The big "what's going on" sentence for the current phase of Shop B. */
+function FlashPhase({ frame, run }: { frame: Frame; run: StoryRun }) {
+  const soldout = list(frame, 'soldout', 'rejected');
+  const moved = list(frame, 'ticket', 'queued', 'processing', 'saved');
+  if (isDone(frame, 'flash')) {
+    return <Narration step="Result" tone="good" text={<>🎉 <b>{frame.orders} orders for {run.stock} sneakers.</b> Every "yes" matched a real sneaker. Shoppers got an answer instantly; the slow paperwork happened calmly in the back.</>} />;
+  }
+  if (soldout.length > 0) {
+    return <Narration step="Phase 3" text={<>🚫 The tickets are gone. Everyone else hears <b>"sold out" immediately</b>, with no waiting and no extra work for the back office. Meanwhile the clerk writes each ticket holder's order, <b>one at a time</b>.</>} />;
+  }
+  if (moved.length > 0) {
+    return <Narration step="Phase 2" text={<>🎟️ The ticket desk hands out tickets <b>one at a time</b>. It can never give the same ticket to two people. <b>{frame.count} left.</b> Ticket holders join the line for the clerk.</>} />;
+  }
+  return <Narration step="Phase 1" text={<>🚪 The doors open. {Object.keys(frame.shoppers).length} shoppers arrive for {run.stock} sneakers. Before anything else, each one goes to the ticket desk.</>} />;
+}
+
+function NaiveScene({ frame, run }: { frame: Frame; run: StoryRun }) {
+  const door = list(frame, 'door');
+  const looked = list(frame, 'looked');
+  const ordered = list(frame, 'ordered');
+  const soldout = list(frame, 'soldout');
+  const oversold = Math.max(0, frame.orders - run.stock);
+  const f = (p: Shopper) => p.id === frame.focus;
 
   return (
-    <div className="card scene scene-a">
-      <Narration {...narr} />
-      <Shelf stock={stock} initial={run.stock} label="Sneakers on the shelf (the shop's records)" />
+    <>
+      <Shelf stock={frame.count} initial={run.stock} label="Sneakers on the shelf (the shop's records)" />
       <div className="lanes">
         <Zone icon="🚪" title="At the door" subtitle="waiting for a cashier" active={door.length > 0}>
-          {door.map((p) => <Token key={p.id} p={p} />)}
+          {door.map((p) => <Token key={p.id} p={p} focus={f(p)} />)}
         </Zone>
         <Arrow active={door.length > 0} />
         <Zone icon="👀" title="Checked the shelf" subtitle="saw stock, about to write the order" tech="SELECT stock … (then a pause)" active={looked.length > 0}>
-          {looked.map((p) => <Token key={p.id} p={p} label={`saw ${p.seen}`} tone="warn" />)}
+          {looked.map((p) => <Token key={p.id} p={p} label={`saw ${p.seen}`} tone="warn" focus={f(p)} />)}
         </Zone>
         <Arrow active={looked.length > 0} />
         <Zone icon="🧾" title="Order written" subtitle="was told: you got it!" tech="UPDATE stock, INSERT order" tone={oversold ? 'bad' : undefined} active={ordered.length > 0}>
           {ordered.map((p) => (
-            <Token key={p.id} p={p} label={(p.orderNo ?? 0) <= run.stock ? `👟 #${p.orderNo}` : '❌ no sneaker!'} tone={(p.orderNo ?? 0) <= run.stock ? 'ok' : 'bad'} />
+            <Token
+              key={p.id}
+              p={p}
+              focus={f(p)}
+              label={(p.orderNo ?? 0) <= run.stock ? `👟 #${p.orderNo}` : '❌ no sneaker!'}
+              tone={(p.orderNo ?? 0) <= run.stock ? 'ok' : 'bad'}
+            />
           ))}
         </Zone>
         <Zone icon="😞" title="Sold out" subtitle="saw an empty shelf" active={soldout.length > 0}>
-          {soldout.map((p) => <Token key={p.id} p={p} />)}
+          {soldout.map((p) => <Token key={p.id} p={p} focus={f(p)} />)}
         </Zone>
       </div>
       <div className="scoreboard">
         <div><span>Sneakers</span><b>{run.stock}</b></div>
-        <div><span>Orders written</span><b className={orders > run.stock ? 'bad' : ''}>{orders}</b></div>
+        <div><span>Orders written</span><b className={frame.orders > run.stock ? 'bad' : ''}>{frame.orders}</b></div>
         <div><span>Customers let down</span><b className={oversold ? 'bad' : ''}>{oversold}</b></div>
       </div>
       <Legend
@@ -242,37 +489,23 @@ function NaiveScene({ s, run, list, at }: { s: StateSnapshot; run: StoryRun; lis
           ['🧾', 'Order written', 'updating the stock and saving the order'],
         ]}
       />
-    </div>
+    </>
   );
 }
 
-function FlashScene({ s, run, list, at }: { s: StateSnapshot; run: StoryRun; list: Shopper[]; at: At }) {
-  const door = at('door');
-  const ticket = at('ticket', 'queued');
-  const processing = at('processing');
-  const saved = at('saved').sort((a, b) => (a.orderNo ?? 0) - (b.orderNo ?? 0));
-  const soldout = at('soldout', 'rejected');
-  const tickets = s.flash.redis.stock ?? run.stock;
-  const book = s.flash.db.reserved + s.flash.db.paid;
-  const done = list.length > 0 && door.length === 0 && ticket.length === 0 && processing.length === 0;
-
-  let narr: { step: string; text: ReactNode; tone?: 'bad' | 'good' };
-  if (done) {
-    narr = { step: 'Result', tone: 'good', text: <>🎉 <b>{saved.length} orders for {run.stock} sneakers.</b> Every "yes" matched a real sneaker. Shoppers got an answer instantly; the slow paperwork happened calmly in the back.</> };
-  } else if (soldout.length > 0) {
-    narr = { step: 'Step 3', text: <>🚫 The tickets are gone. Everyone else hears <b>"sold out" immediately</b>, with no waiting and no extra work for the back office. Meanwhile the clerk writes each ticket holder's order, <b>one at a time</b>.</> };
-  } else if (ticket.length + processing.length + saved.length > 0) {
-    narr = { step: 'Step 2', text: <>🎟️ The ticket desk hands out tickets <b>one at a time</b>. It can never give the same ticket to two people. <b>{tickets} left.</b> Ticket holders join the line for the clerk.</> };
-  } else {
-    narr = { step: 'Step 1', text: <>🚪 The doors open. {list.length} shoppers arrive for {run.stock} sneakers. Before anything else, each one goes to the ticket desk.</> };
-  }
+function FlashScene({ frame, run }: { frame: Frame; run: StoryRun }) {
+  const door = list(frame, 'door');
+  const ticket = list(frame, 'ticket', 'queued');
+  const processing = list(frame, 'processing');
+  const saved = list(frame, 'saved');
+  const soldout = list(frame, 'soldout', 'rejected');
+  const f = (p: Shopper) => p.id === frame.focus;
 
   return (
-    <div className="card scene scene-b">
-      <Narration {...narr} />
+    <>
       <div className="lanes lanes-b">
         <Zone icon="🚪" title="At the door" subtitle="arriving" active={door.length > 0}>
-          {door.map((p) => <Token key={p.id} p={p} />)}
+          {door.map((p) => <Token key={p.id} p={p} focus={f(p)} />)}
         </Zone>
         <Arrow active={door.length > 0} />
         <Zone
@@ -284,36 +517,36 @@ function FlashScene({ s, run, list, at }: { s: StateSnapshot; run: StoryRun; lis
           footer={
             <div className="tickets">
               {Array.from({ length: run.stock }, (_, i) => (
-                <span key={i} className={`ticket ${i < tickets ? '' : 'taken'}`}>🎟️</span>
+                <span key={i} className={`ticket ${i < frame.count ? '' : 'taken'}`}>🎟️</span>
               ))}
-              <b>{tickets} left</b>
+              <b>{frame.count} left</b>
             </div>
           }
         >
           {soldout.length > 0 && (
             <div className="soldout-bin">
               <div className="bin-title">😞 Told "sold out" instantly</div>
-              {soldout.map((p) => <Token key={p.id} p={p} />)}
+              {soldout.map((p) => <Token key={p.id} p={p} focus={f(p)} />)}
             </div>
           )}
         </Zone>
         <Arrow active={ticket.length > 0} />
         <Zone icon="🧍" title="Waiting line" subtitle="has a ticket, waiting for paperwork" tech="message queue" active={ticket.length > 0}>
-          {ticket.map((p) => <Token key={p.id} p={p} label="🎟️" tone="ok" />)}
+          {ticket.map((p) => <Token key={p.id} p={p} label="🎟️" tone="ok" focus={f(p)} />)}
         </Zone>
         <Arrow active={processing.length > 0} />
         <Zone icon="✍️" title="Clerk" subtitle="writes one order at a time" tech="worker" active={processing.length > 0}>
-          {processing.map((p) => <Token key={p.id} p={p} label="writing…" />)}
+          {processing.map((p) => <Token key={p.id} p={p} label="writing…" focus={f(p)} />)}
         </Zone>
         <Arrow active={processing.length > 0} />
         <Zone icon="📒" title="Order book" subtitle="the official record" tech="PostgreSQL database" tone="good" active={saved.length > 0}>
-          {saved.map((p) => <Token key={p.id} p={p} label={`👟 #${p.orderNo}`} tone="ok" />)}
+          {saved.map((p) => <Token key={p.id} p={p} label={`👟 #${p.orderNo}`} tone="ok" focus={f(p)} />)}
         </Zone>
       </div>
       <div className="scoreboard">
         <div><span>Sneakers</span><b>{run.stock}</b></div>
-        <div><span>Tickets given</span><b>{run.stock - Math.max(0, tickets)}</b></div>
-        <div><span>Orders in the book</span><b>{book}</b></div>
+        <div><span>Tickets given</span><b>{run.stock - Math.max(0, frame.count)}</b></div>
+        <div><span>Orders in the book</span><b>{frame.orders}</b></div>
         <div><span>Customers let down</span><b className="good">0</b></div>
       </div>
       <Legend
@@ -324,7 +557,7 @@ function FlashScene({ s, run, list, at }: { s: StateSnapshot; run: StoryRun; lis
           ['📒', 'Order book', 'the database: the permanent, official record'],
         ]}
       />
-    </div>
+    </>
   );
 }
 

@@ -28,7 +28,7 @@ export class NaiveService {
     try {
       const res = cfg.naiveVariant === 'atomic' ? await this.buyAtomic(userId) : await this.buyUnsafe(userId, cfg.naiveVariant, cfg.naiveDelayMs);
       if (res.status === 'ORDER_CREATED') {
-        await this.telemetry.record({ type: 'NAIVE_ORDER_CREATED', mode: 'naive', userId, detail: `read stock=${res.stockRead ?? '?'}` }, { hash: M, incr: { requests: 1, success: 1 } });
+        await this.telemetry.record({ type: 'NAIVE_ORDER_CREATED', mode: 'naive', userId, detail: `read stock=${res.stockRead ?? '?'}${res.stockAfter !== undefined ? `; stock now ${res.stockAfter}` : ''}` }, { hash: M, incr: { requests: 1, success: 1 } });
       } else {
         await this.telemetry.record({ type: 'NAIVE_SOLD_OUT', mode: 'naive', userId }, { hash: M, incr: { requests: 1, soldOut: 1 } });
       }
@@ -64,13 +64,13 @@ export class NaiveService {
     try {
       if (delayMs > 0) await sleep(delayMs); // 3. the window between check and act
 
-      await this.prisma.product.update({
+      const updated = await this.prisma.product.update({
         where: { id: PRODUCT },
         data: variant === 'check-then-act' ? { stock: { decrement: 1 } } : { stock: product.stock - 1 }, // 4. UPDATE
       });
       const order = await this.prisma.order.create({ data: { productId: PRODUCT, userId, source: 'NAIVE', status: 'PAID' } }); // 5. INSERT
       await this.countQueries(2);
-      return { status: 'ORDER_CREATED', orderId: order.id, stockRead: product.stock, message: 'Order created.' };
+      return { status: 'ORDER_CREATED', orderId: order.id, stockRead: product.stock, stockAfter: updated.stock, message: 'Order created.' };
     } finally {
       await this.telemetry.gauge(M, 'raceWindow', -1);
     }

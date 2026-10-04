@@ -211,6 +211,8 @@ export interface NaiveBuyResponse {
   status: 'ORDER_CREATED' | 'SOLD_OUT';
   orderId?: string;
   stockRead?: number;
+  /** Stock value right after this request's UPDATE (unsafe variants). */
+  stockAfter?: number;
   message: string;
 }
 
