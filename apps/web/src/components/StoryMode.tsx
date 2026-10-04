@@ -4,7 +4,20 @@ import { post } from '../api';
 
 const AVATARS = ['🧑', '👩', '👨', '🧓', '👧', '🧔', '👩‍🦱', '👨‍🦰', '👱‍♀️', '🧑‍🦱', '👵', '👦', '👩‍🦳', '🧑‍🦲', '👨‍🦳', '👱'];
 
-type Stage = 'door' | 'looked' | 'ordered' | 'soldout' | 'ticket' | 'queued' | 'processing' | 'saved' | 'rejected';
+type Stage =
+  | 'door'
+  | 'looked'
+  | 'ordered'
+  | 'soldout'
+  | 'ticket'
+  | 'queued'
+  | 'processing'
+  | 'saved'
+  | 'rejected'
+  | 'waiting' // on the waitlist
+  | 'offered' // a returned sneaker is held for them
+  | 'paid'
+  | 'walked'; // didn't pay in time
 type Playback = 'auto' | 'step';
 
 interface Shopper {
@@ -14,8 +27,12 @@ interface Shopper {
   stage: Stage;
   /** Shop A: the stock value this shopper saw on the shelf. */
   seen?: number;
-  /** 1-based position among completed orders. */
+  /** Which sneaker (1..stock) this shopper's order is for. A waitlisted shopper inherits the walk-away's. */
   orderNo?: number;
+  /** Place on the waitlist (1 = next to get a returned sneaker). */
+  waitPos?: number;
+  /** Walk-away: the waitlisted shopper their sneaker was handed to. */
+  handedTo?: string;
 }
 
 /**
@@ -26,8 +43,12 @@ interface Frame {
   shoppers: Record<string, Shopper>;
   /** Shop A: the shelf count. Shop B: tickets left at the desk. */
   count: number;
-  /** Shop A: orders written. Shop B: orders in the order book. */
+  /** Shop A: orders written. Shop B: active orders in the order book. */
   orders: number;
+  /** Shop B: sneakers numbered so far (never reused). */
+  issued: number;
+  /** Shop B: paid orders. */
+  paid: number;
   caption: string;
   /** The shopper this step is about (highlighted). */
   focus?: string;
@@ -43,10 +64,29 @@ const STAGE_FROM_EVENT: Partial<Record<DemoEvent['type'], Stage>> = {
   WORKER_PICKED: 'processing',
   ORDER_CREATED: 'saved',
   RESERVATION_REJECTED: 'rejected',
+  WAITLIST_JOINED: 'waiting',
+  WAITLIST_OFFERED: 'offered',
+  PAYMENT_COMPLETED: 'paid',
+  RESERVATION_EXPIRED: 'walked',
 };
 
-// Never move a shopper backwards (e.g. the worker can report "picked" before the API reports "queued").
-const RANK: Record<Stage, number> = { door: 0, looked: 1, ticket: 1, queued: 2, processing: 3, ordered: 4, saved: 4, soldout: 4, rejected: 4 };
+// Which moves are allowed from each stage. Anything else is ignored, so a shopper never moves backwards
+// (e.g. the worker can report "picked" before the API reports "queued").
+const NEXT: Record<Stage, Stage[]> = {
+  door: ['looked', 'ordered', 'soldout', 'ticket'],
+  looked: ['ordered'],
+  ordered: [],
+  ticket: ['queued', 'processing', 'saved', 'rejected'],
+  queued: ['processing', 'saved', 'rejected'],
+  processing: ['saved', 'rejected'],
+  saved: ['paid', 'walked'],
+  soldout: ['waiting'],
+  waiting: ['offered'],
+  offered: ['queued', 'processing', 'saved', 'rejected'],
+  paid: [],
+  walked: [],
+  rejected: [],
+};
 
 const STEP_MS: Record<StorySpeed, number> = { slow: 1100, 'very-slow': 1900 };
 
@@ -60,10 +100,11 @@ const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
 function nextFrame(prev: Frame, e: DemoEvent): Frame | null {
   const cur = prev.shoppers[e.userId ?? ''];
   const stage = STAGE_FROM_EVENT[e.type];
-  if (!cur || !stage || RANK[stage] < RANK[cur.stage]) return null;
+  if (!cur || !stage || !NEXT[cur.stage].includes(stage)) return null;
   const p: Shopper = { ...cur, stage };
   const name = `${cur.avatar} Shopper ${cur.n}`;
-  let { count, orders } = prev;
+  const shoppers = { ...prev.shoppers };
+  let { count, orders, issued, paid } = prev;
   let caption: string;
 
   switch (e.type) {
@@ -100,13 +141,38 @@ function nextFrame(prev: Frame, e: DemoEvent): Frame | null {
       break;
     case 'ORDER_CREATED':
       orders += 1;
-      p.orderNo = orders;
-      caption = `${name}'s order is now in the official order book (order #${orders}).`;
+      if (p.orderNo === undefined) p.orderNo = ++issued; // a waitlisted shopper keeps the sneaker number they inherited
+      caption = `${name}'s order is now in the official order book (sneaker #${p.orderNo}). Waiting for payment…`;
       break;
+    case 'WAITLIST_JOINED':
+      p.waitPos = num(/#(\d+)/, e.detail);
+      caption = `${name} was told "sold out", so they join the waitlist: #${p.waitPos} in line. If a sneaker comes back, it will be held for them.`;
+      break;
+    case 'PAYMENT_COMPLETED':
+      paid += 1;
+      caption = `${name} pays. Sneaker #${p.orderNo} is theirs. ✅`;
+      break;
+    case 'RESERVATION_EXPIRED':
+      orders -= 1;
+      caption = `${name} walks away without paying, and their time runs out. Sneaker #${p.orderNo} is free again… who gets it?`;
+      break;
+    case 'WAITLIST_OFFERED': {
+      // The sneaker comes from the most recent walk-away whose sneaker hasn't been handed on yet.
+      const giver = Object.values(shoppers).find((x) => x.stage === 'walked' && !x.handedTo);
+      if (giver) {
+        shoppers[giver.id] = { ...giver, handedTo: p.id };
+        p.orderNo = giver.orderNo;
+      }
+      p.waitPos = undefined;
+      for (const x of Object.values(shoppers)) if (x.stage === 'waiting' && x.waitPos) shoppers[x.id] = { ...x, waitPos: x.waitPos - 1 };
+      caption = `Not whoever clicks fastest: the sneaker goes straight to ${name}, #1 on the waitlist. They get a notification: "a sneaker came back, it's held for you!"`;
+      break;
+    }
     default:
       caption = `${name}'s ticket was refused by the order book.`;
   }
-  return { shoppers: { ...prev.shoppers, [p.id]: p }, count, orders, caption, focus: p.id };
+  shoppers[p.id] = p;
+  return { shoppers, count, orders, issued, paid, caption, focus: p.id };
 }
 
 function firstFrame(run: StoryRun): Frame {
@@ -117,6 +183,8 @@ function firstFrame(run: StoryRun): Frame {
     shoppers,
     count: run.stock,
     orders: 0,
+    issued: 0,
+    paid: 0,
     caption: `The doors open: ${run.shoppers.length} shoppers want ${run.stock} sneakers. Press Next ▶ (or Play) to follow them.`,
   };
 }
@@ -224,7 +292,7 @@ export function StoryMode({ events, notify }: { events: DemoEvent[]; notify: (m:
             <span className="big">🏬</span>
             <span>
               <b>Shop B: the ticket-desk shop</b>
-              <small>A ticket desk decides first, clerks do paperwork later</small>
+              <small>A ticket desk decides first, a fair waitlist catches returns</small>
             </span>
           </button>
           <label className="speed">
@@ -283,8 +351,11 @@ export function StoryMode({ events, notify }: { events: DemoEvent[]; notify: (m:
 }
 
 function isDone(f: Frame, mode: Mode): boolean {
-  const open: Stage[] = mode === 'naive' ? ['door', 'looked'] : ['door', 'ticket', 'queued', 'processing'];
-  return Object.values(f.shoppers).every((p) => !open.includes(p.stage));
+  const open: Stage[] = mode === 'naive' ? ['door', 'looked'] : ['door', 'ticket', 'queued', 'processing', 'offered', 'saved'];
+  const all = Object.values(f.shoppers);
+  // A walk-away's sneaker that hasn't been handed on yet (while people are waiting) means the story isn't over.
+  const pendingHandoff = all.some((p) => p.stage === 'walked' && !p.handedTo) && all.some((p) => p.stage === 'waiting');
+  return !pendingHandoff && all.every((p) => !open.includes(p.stage));
 }
 
 function Stepper(props: {
@@ -427,13 +498,33 @@ function NaivePhase({ frame, run }: { frame: Frame; run: StoryRun }) {
 
 /** The big "what's going on" sentence for the current phase of Shop B. */
 function FlashPhase({ frame, run }: { frame: Frame; run: StoryRun }) {
-  const soldout = list(frame, 'soldout', 'rejected');
-  const moved = list(frame, 'ticket', 'queued', 'processing', 'saved');
+  const soldout = list(frame, 'soldout', 'rejected', 'waiting');
+  const waiting = list(frame, 'waiting');
+  const moved = list(frame, 'ticket', 'queued', 'processing', 'saved', 'paid');
+  const walked = list(frame, 'walked');
   if (isDone(frame, 'flash')) {
-    return <Narration step="Result" tone="good" text={<>🎉 <b>{frame.orders} orders for {run.stock} sneakers.</b> Every "yes" matched a real sneaker. Shoppers got an answer instantly; the slow paperwork happened calmly in the back.</>} />;
+    return (
+      <Narration
+        step="Result"
+        tone="good"
+        text={
+          <>
+            🎉 <b>{frame.paid} sneakers sold and paid for, out of {run.stock}.</b> Every "yes" matched a real sneaker.
+            {walked.length > 0 && <> One shopper walked away, and their sneaker went to <b>the first person on the waitlist</b>, not to whoever clicked fastest.</>}
+            {waiting.length > 0 && <> {waiting.length} shoppers are still on the waitlist, in order.</>}
+          </>
+        }
+      />
+    );
+  }
+  if (walked.length > 0) {
+    return <Narration step="Phase 5" text={<>⌛ A shopper didn't pay in time. Their sneaker is <b>not</b> put back for anyone to grab: in one atomic step it's <b>handed to #1 on the waitlist</b>, who is notified and goes through the clerk like everyone else.</>} />;
+  }
+  if (frame.paid > 0) {
+    return <Narration step="Phase 4" text={<>💳 Ticket holders pay for their sneakers… but watch: one of them is about to walk away without paying.</>} />;
   }
   if (soldout.length > 0) {
-    return <Narration step="Phase 3" text={<>🚫 The tickets are gone. Everyone else hears <b>"sold out" immediately</b>, with no waiting and no extra work for the back office. Meanwhile the clerk writes each ticket holder's order, <b>one at a time</b>.</>} />;
+    return <Narration step="Phase 3" text={<>🚫 The tickets are gone. Everyone else hears <b>"sold out" immediately</b> and joins the <b>🔔 waitlist</b>, in order. Meanwhile the clerk writes each ticket holder's order, <b>one at a time</b>.</>} />;
   }
   if (moved.length > 0) {
     return <Narration step="Phase 2" text={<>🎟️ The ticket desk hands out tickets <b>one at a time</b>. It can never give the same ticket to two people. <b>{frame.count} left.</b> Ticket holders join the line for the clerk.</>} />;
@@ -495,11 +586,15 @@ function NaiveScene({ frame, run }: { frame: Frame; run: StoryRun }) {
 
 function FlashScene({ frame, run }: { frame: Frame; run: StoryRun }) {
   const door = list(frame, 'door');
-  const ticket = list(frame, 'ticket', 'queued');
+  const line = list(frame, 'ticket', 'queued', 'offered');
   const processing = list(frame, 'processing');
-  const saved = list(frame, 'saved');
+  const book = list(frame, 'saved', 'paid', 'walked');
   const soldout = list(frame, 'soldout', 'rejected');
+  const waitlist = Object.values(frame.shoppers)
+    .filter((x) => x.stage === 'waiting')
+    .sort((a, b) => (a.waitPos ?? 99) - (b.waitPos ?? 99));
   const f = (p: Shopper) => p.id === frame.focus;
+  const nameOf = (id?: string) => (id ? `Shopper ${frame.shoppers[id]?.n}` : '');
 
   return (
     <>
@@ -512,8 +607,8 @@ function FlashScene({ frame, run }: { frame: Frame; run: StoryRun }) {
           icon="🎟️"
           title="Ticket desk"
           subtitle="instant yes / no"
-          tech="Redis: atomic counter"
-          active={door.length > 0}
+          tech="Redis: atomic counter + waitlist"
+          active={door.length > 0 || list(frame, 'offered').length > 0}
           footer={
             <div className="tickets">
               {Array.from({ length: run.stock }, (_, i) => (
@@ -529,32 +624,55 @@ function FlashScene({ frame, run }: { frame: Frame; run: StoryRun }) {
               {soldout.map((p) => <Token key={p.id} p={p} focus={f(p)} />)}
             </div>
           )}
+          {waitlist.length > 0 && (
+            <div className="soldout-bin waitlist-bin">
+              <div className="bin-title">🔔 Waitlist: first in line gets the next returned sneaker</div>
+              {waitlist.map((p) => <Token key={p.id} p={p} label={`#${p.waitPos}`} tone="warn" focus={f(p)} />)}
+            </div>
+          )}
         </Zone>
-        <Arrow active={ticket.length > 0} />
-        <Zone icon="🧍" title="Waiting line" subtitle="has a ticket, waiting for paperwork" tech="message queue" active={ticket.length > 0}>
-          {ticket.map((p) => <Token key={p.id} p={p} label="🎟️" tone="ok" focus={f(p)} />)}
+        <Arrow active={line.length > 0} />
+        <Zone icon="🧍" title="Waiting line" subtitle="has a ticket, waiting for paperwork" tech="message queue" active={line.length > 0}>
+          {line.map((p) => <Token key={p.id} p={p} label={p.stage === 'offered' ? '🔔 from waitlist' : '🎟️'} tone="ok" focus={f(p)} />)}
         </Zone>
         <Arrow active={processing.length > 0} />
         <Zone icon="✍️" title="Clerk" subtitle="writes one order at a time" tech="worker" active={processing.length > 0}>
           {processing.map((p) => <Token key={p.id} p={p} label="writing…" focus={f(p)} />)}
         </Zone>
         <Arrow active={processing.length > 0} />
-        <Zone icon="📒" title="Order book" subtitle="the official record" tech="PostgreSQL database" tone="good" active={saved.length > 0}>
-          {saved.map((p) => <Token key={p.id} p={p} label={`👟 #${p.orderNo}`} tone="ok" focus={f(p)} />)}
+        <Zone icon="📒" title="Order book" subtitle="the official record" tech="PostgreSQL database" tone="good" active={book.length > 0}>
+          {book.map((p) =>
+            p.stage === 'walked' ? (
+              <span key={p.id} className="faded">
+                <Token p={p} label={p.handedTo ? `⌛ #${p.orderNo} → ${nameOf(p.handedTo)}` : `⌛ didn't pay`} tone="bad" focus={f(p)} />
+              </span>
+            ) : (
+              <Token
+                key={p.id}
+                p={p}
+                label={p.stage === 'paid' ? `✅ 👟 #${p.orderNo} paid` : `👟 #${p.orderNo} · unpaid`}
+                tone={p.stage === 'paid' ? 'ok' : 'warn'}
+                focus={f(p)}
+              />
+            ),
+          )}
         </Zone>
       </div>
       <div className="scoreboard">
         <div><span>Sneakers</span><b>{run.stock}</b></div>
-        <div><span>Tickets given</span><b>{run.stock - Math.max(0, frame.count)}</b></div>
-        <div><span>Orders in the book</span><b>{frame.orders}</b></div>
+        <div><span>Paid</span><b className="good">{frame.paid}</b></div>
+        <div><span>Active orders</span><b>{frame.orders}</b></div>
+        <div><span>On the waitlist</span><b>{waitlist.length}</b></div>
         <div><span>Customers let down</span><b className="good">0</b></div>
       </div>
       <Legend
         items={[
           ['🎟️', 'Ticket desk', 'Redis: a super-fast counter that hands out exactly one ticket per sneaker, never two at once'],
+          ['🔔', 'Waitlist', 'a list in Redis, in arrival order. A returned sneaker goes to #1 in the same atomic step that frees it, so nobody can snipe it'],
           ['🧍', 'Waiting line', 'a message queue: absorbs the rush so the database is never overwhelmed'],
           ['✍️', 'Clerk', 'a background worker writing orders at a safe pace (slowed to 1 clerk here)'],
           ['📒', 'Order book', 'the database: the permanent, official record'],
+          ['⌛', "Didn't pay", 'every reservation has a time limit; when it runs out, the sneaker is freed'],
         ]}
       />
     </>

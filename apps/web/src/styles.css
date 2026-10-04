@@ -1436,3 +1436,9 @@ td.ellipsis {
   border-color: var(--warn);
   background: var(--warn-bg);
 }
+.waitlist-bin .bin-title {
+  color: var(--warn);
+}
+.faded {
+  opacity: 0.55;
+}
