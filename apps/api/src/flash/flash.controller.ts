@@ -1,9 +1,10 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, NotFoundException, Param, Post, Query, Res } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, HttpCode, HttpStatus, NotFoundException, Param, Post, Query, Res } from '@nestjs/common';
 import type { BuyResponse } from '@flash/shared';
 import type { Response } from 'express';
 import { intInRange, optionalString } from '../common/http';
 import { LifecycleService, PayCode } from './lifecycle.service';
 import { ReservationService, SimulatedCrashError } from './reservation.service';
+import { WaitlistService } from './waitlist.service';
 
 const BUY_STATUS: Record<BuyResponse['status'], number> = {
   RESERVED: HttpStatus.ACCEPTED, // 202: accepted, processing continues asynchronously
@@ -28,7 +29,29 @@ export class FlashController {
   constructor(
     private readonly reservations: ReservationService,
     private readonly lifecycle: LifecycleService,
+    private readonly waitlist: WaitlistService,
   ) {}
+
+  /** Sold out? Join the waitlist: if a unit comes back, it is held for the first person in line. */
+  @Post('waitlist')
+  @HttpCode(200)
+  async joinWaitlist(@Body() body: { userId?: unknown }) {
+    const userId = optionalString(body?.userId, 'userId');
+    if (!userId) throw new BadRequestException('userId is required');
+    return this.waitlist.join(userId);
+  }
+
+  /** Where am I in line, or was a sneaker held for me? (The demo's stand-in for a push notification.) */
+  @Get('waitlist/:userId')
+  waitlistStatus(@Param('userId') userId: string) {
+    return this.waitlist.status(userId);
+  }
+
+  @Delete('waitlist/:userId')
+  @HttpCode(204)
+  leaveWaitlist(@Param('userId') userId: string) {
+    return this.waitlist.leave(userId);
+  }
 
   @Post('buy')
   async buy(@Body() body: { userId?: unknown }, @Res({ passthrough: true }) res: Response): Promise<BuyResponse> {

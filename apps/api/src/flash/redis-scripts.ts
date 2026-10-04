@@ -12,13 +12,14 @@
 //
 // Cost: while a script runs, Redis serves nobody else, so scripts must stay tiny.
 import type Redis from 'ioredis';
+import { randomUUID } from 'node:crypto';
 import { keys } from '../common/keys';
 
 /** After a reservation reaches a final state we keep its Redis hash for an hour for inspection, then let Redis delete it.
  * TTLs are for garbage collection here, never for business logic. */
 const TERMINAL_GC_TTL_SEC = 3600;
 
-// KEYS: 1 stock, 2 reservation hash, 3 user key, 4 pending zset, 5 sale id
+// KEYS: 1 stock, 2 reservation hash, 3 user key, 4 pending zset, 5 sale id, 6 waitlist
 // ARGV: 1 reservationId, 2 userId, 3 nowMs, 4 expiresAtMs
 const RESERVE_LUA = `
 local stock = redis.call('GET', KEYS[1])
@@ -38,6 +39,7 @@ local remaining = redis.call('DECR', KEYS[1])
 redis.call('HSET', KEYS[2], 'status', 'RESERVED', 'userId', ARGV[2], 'createdAt', ARGV[3], 'expiresAt', ARGV[4], 'confirmed', '0', 'saleId', sale)
 redis.call('SET', KEYS[3], ARGV[1])
 redis.call('ZADD', KEYS[4], ARGV[3], ARGV[1])
+redis.call('ZREM', KEYS[6], ARGV[2])
 return {'ALLOWED', remaining, sale, ''}
 `;
 
@@ -76,11 +78,42 @@ redis.call('EXPIRE', KEYS[1], ARGV[2])
 return 'REJECTED'
 `;
 
+// Shared by both release scripts: a freed unit goes to the FIRST shopper on the waitlist (as a
+// brand-new reservation), and only goes back to the public stock if nobody is waiting. Doing this
+// inside the same script as the release is what makes it fair: there is no moment where the unit
+// sits in the public stock and a random buyer could snipe it.
+//
+// The next user's key is built inside the script (we only learn who is next while running). Redis
+// asks scripts to declare their keys up front; this one is still safe on a Cluster because it
+// shares the product's {hash tag}, so it lives on the same slot as every declared key.
+const GIVE_BACK_LUA = `
+local function giveBack(stockKey, waitKey, saleKey, newResKey, pendingKey, newRid, nowMs, expMs, userPrefix)
+  while true do
+    local popped = redis.call('ZPOPMIN', waitKey)
+    if #popped == 0 then break end
+    local nextUser = popped[1]
+    local nextUserKey = userPrefix .. nextUser
+    if redis.call('EXISTS', nextUserKey) == 0 then
+      local sale = redis.call('GET', saleKey) or ''
+      redis.call('HSET', newResKey, 'status', 'RESERVED', 'userId', nextUser, 'createdAt', nowMs, 'expiresAt', expMs, 'confirmed', '0', 'saleId', sale, 'via', 'waitlist')
+      redis.call('SET', nextUserKey, newRid)
+      redis.call('ZADD', pendingKey, nowMs, newRid)
+      return nextUser
+    end
+    -- this shopper already holds a unit (bought normally since joining): skip them
+  end
+  redis.call('INCR', stockKey)
+  return false
+end
+`;
+
 // Give a unit back. Idempotent: only a reservation still in RESERVED can be released,
 // and releasing flips it out of RESERVED in the same atomic step.
-// KEYS: 1 stock, 2 reservation hash, 3 user key, 4 pending zset
-// ARGV: 1 reservationId, 2 new status, 3 gc ttl seconds
-const RELEASE_LUA = `
+// KEYS: 1 stock, 2 reservation hash, 3 user key, 4 pending zset, 5 waitlist, 6 sale id, 7 hand-off reservation hash
+// ARGV: 1 reservationId, 2 new status, 3 gc ttl seconds, 4 hand-off reservationId, 5 nowMs, 6 hand-off expiresAtMs, 7 user key prefix
+const RELEASE_LUA =
+  GIVE_BACK_LUA +
+  `
 local status = redis.call('HGET', KEYS[2], 'status')
 if not status then
   return 'MISSING'
@@ -89,20 +122,25 @@ if status ~= 'RESERVED' then
   return 'NOT_RESERVED:' .. status
 end
 redis.call('HSET', KEYS[2], 'status', ARGV[2])
-redis.call('INCR', KEYS[1])
 if redis.call('GET', KEYS[3]) == ARGV[1] then
   redis.call('DEL', KEYS[3])
 end
 redis.call('ZREM', KEYS[4], ARGV[1])
 redis.call('EXPIRE', KEYS[2], ARGV[3])
+local handedTo = giveBack(KEYS[1], KEYS[5], KEYS[6], KEYS[7], KEYS[4], ARGV[4], ARGV[5], ARGV[6], ARGV[7])
+if handedTo then
+  return 'HANDED_OFF:' .. handedTo
+end
 return 'RELEASED'
 `;
 
 // Reconciler: release a reservation that Redis admitted but that never reached the
 // worker (e.g. the API crashed before publishing to the queue).
-// KEYS: 1 stock, 2 reservation hash, 3 user key, 4 pending zset
-// ARGV: 1 reservationId, 2 cutoff createdAt ms, 3 gc ttl seconds
-const RELEASE_ORPHAN_LUA = `
+// KEYS: same as RELEASE_LUA
+// ARGV: 1 reservationId, 2 cutoff createdAt ms, 3 gc ttl seconds, 4-7 same as RELEASE_LUA
+const RELEASE_ORPHAN_LUA =
+  GIVE_BACK_LUA +
+  `
 local h = redis.call('HMGET', KEYS[2], 'status', 'confirmed', 'createdAt')
 local status, confirmed, createdAt = h[1], h[2], h[3]
 if not status then
@@ -119,13 +157,33 @@ if tonumber(createdAt) > tonumber(ARGV[2]) then
   return 'TOO_YOUNG'
 end
 redis.call('HSET', KEYS[2], 'status', 'ORPHAN_RELEASED')
-redis.call('INCR', KEYS[1])
 if redis.call('GET', KEYS[3]) == ARGV[1] then
   redis.call('DEL', KEYS[3])
 end
 redis.call('ZREM', KEYS[4], ARGV[1])
 redis.call('EXPIRE', KEYS[2], ARGV[3])
+local handedTo = giveBack(KEYS[1], KEYS[5], KEYS[6], KEYS[7], KEYS[4], ARGV[4], ARGV[5], ARGV[6], ARGV[7])
+if handedTo then
+  return 'HANDED_OFF:' .. handedTo
+end
 return 'RELEASED'
+`;
+
+// Join the waitlist (only makes sense when sold out, and not while already holding a unit).
+// KEYS: 1 stock, 2 user key, 3 waitlist   ARGV: 1 userId, 2 nowMs
+const JOIN_WAITLIST_LUA = `
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return {'ALREADY_RESERVED', 0}
+end
+local stock = redis.call('GET', KEYS[1])
+if not stock then
+  return {'NOT_INITIALIZED', 0}
+end
+if tonumber(stock) > 0 then
+  return {'STOCK_AVAILABLE', 0}
+end
+redis.call('ZADD', KEYS[3], 'NX', ARGV[2], ARGV[1])
+return {'WAITING', redis.call('ZRANK', KEYS[3], ARGV[1]) + 1}
 `;
 
 // KEYS: 1 reservation hash   ARGV: 1 gc ttl seconds
@@ -155,6 +213,20 @@ return 1
 
 export type ReserveResult = 'ALLOWED' | 'SOLD_OUT' | 'ALREADY_RESERVED' | 'NOT_INITIALIZED';
 
+export type JoinResult = 'WAITING' | 'STOCK_AVAILABLE' | 'ALREADY_RESERVED' | 'NOT_INITIALIZED';
+
+/** The reservation a freed unit becomes if someone is on the waitlist (id and times chosen by the caller). */
+export interface Handoff {
+  reservationId: string;
+  nowMs: number;
+  expiresAtMs: number;
+}
+
+const defaultHandoff = (ttlMs = 30_000): Handoff => {
+  const nowMs = Date.now();
+  return { reservationId: randomUUID(), nowMs, expiresAtMs: nowMs + ttlMs };
+};
+
 export interface ReserveOutput {
   result: ReserveResult;
   remaining: number;
@@ -173,11 +245,12 @@ export interface ReserveInput {
 }
 
 interface ScriptCommands {
-  flashReserve(k1: string, k2: string, k3: string, k4: string, k5: string, ...argv: (string | number)[]): Promise<[string, number, string, string]>;
+  flashReserve(k1: string, k2: string, k3: string, k4: string, k5: string, k6: string, ...argv: (string | number)[]): Promise<[string, number, string, string]>;
   flashConfirm(k1: string): Promise<string>;
   flashMarkRejected(k1: string, k2: string, k3: string, rid: string, ttl: number): Promise<string>;
-  flashRelease(k1: string, k2: string, k3: string, k4: string, ...argv: (string | number)[]): Promise<string>;
-  flashReleaseOrphan(k1: string, k2: string, k3: string, k4: string, ...argv: (string | number)[]): Promise<string>;
+  flashRelease(...keysThenArgv: (string | number)[]): Promise<string>;
+  flashReleaseOrphan(...keysThenArgv: (string | number)[]): Promise<string>;
+  flashJoinWaitlist(k1: string, k2: string, k3: string, userId: string, nowMs: number): Promise<[string, number]>;
   flashMarkPaid(k1: string, ttl: number): Promise<string>;
   flashRecordMin(k1: string, value: number): Promise<number>;
 }
@@ -188,11 +261,12 @@ export class ReservationScripts {
   constructor(redis: Redis) {
     // defineCommand loads the script once (EVALSHA) and exposes it as a method.
     const defs: [keyof ScriptCommands, number, string][] = [
-      ['flashReserve', 5, RESERVE_LUA],
+      ['flashReserve', 6, RESERVE_LUA],
       ['flashConfirm', 1, CONFIRM_LUA],
       ['flashMarkRejected', 3, MARK_REJECTED_LUA],
-      ['flashRelease', 4, RELEASE_LUA],
-      ['flashReleaseOrphan', 4, RELEASE_ORPHAN_LUA],
+      ['flashRelease', 7, RELEASE_LUA],
+      ['flashReleaseOrphan', 7, RELEASE_ORPHAN_LUA],
+      ['flashJoinWaitlist', 3, JOIN_WAITLIST_LUA],
       ['flashMarkPaid', 1, MARK_PAID_LUA],
       ['flashRecordMin', 1, RECORD_MIN_LUA],
     ];
@@ -210,6 +284,7 @@ export class ReservationScripts {
       keys.user(i.productId, i.userId),
       keys.pending(i.productId),
       keys.sale(i.productId),
+      keys.waitlist(i.productId),
       i.reservationId,
       i.userId,
       i.nowMs,
@@ -276,29 +351,52 @@ export class ReservationScripts {
     );
   }
 
-  /** Returns 'RELEASED' only for the one call that actually gave the unit back. */
-  release(productId: string, reservationId: string, userId: string, newStatus: 'EXPIRED'): Promise<string> {
+  /**
+   * Returns 'RELEASED' (unit back in public stock) or 'HANDED_OFF:<userId>' (unit given to the first
+   * shopper on the waitlist as reservation `handoff.reservationId`) only for the one call that actually
+   * freed the unit; anything else means there was nothing to free.
+   */
+  release(productId: string, reservationId: string, userId: string, newStatus: 'EXPIRED', handoff: Handoff = defaultHandoff()): Promise<string> {
     return this.r.flashRelease(
-      keys.stock(productId),
-      keys.reservation(productId, reservationId),
-      keys.user(productId, userId),
-      keys.pending(productId),
+      ...this.releaseKeys(productId, reservationId, userId, handoff),
       reservationId,
       newStatus,
       TERMINAL_GC_TTL_SEC,
+      handoff.reservationId,
+      handoff.nowMs,
+      handoff.expiresAtMs,
+      keys.userPrefix(productId),
     );
   }
 
-  releaseOrphan(productId: string, reservationId: string, userId: string, cutoffMs: number): Promise<string> {
+  releaseOrphan(productId: string, reservationId: string, userId: string, cutoffMs: number, handoff: Handoff = defaultHandoff()): Promise<string> {
     return this.r.flashReleaseOrphan(
+      ...this.releaseKeys(productId, reservationId, userId, handoff),
+      reservationId,
+      cutoffMs,
+      TERMINAL_GC_TTL_SEC,
+      handoff.reservationId,
+      handoff.nowMs,
+      handoff.expiresAtMs,
+      keys.userPrefix(productId),
+    );
+  }
+
+  private releaseKeys(productId: string, reservationId: string, userId: string, handoff: Handoff): string[] {
+    return [
       keys.stock(productId),
       keys.reservation(productId, reservationId),
       keys.user(productId, userId),
       keys.pending(productId),
-      reservationId,
-      cutoffMs,
-      TERMINAL_GC_TTL_SEC,
-    );
+      keys.waitlist(productId),
+      keys.sale(productId),
+      keys.reservation(productId, handoff.reservationId),
+    ];
+  }
+
+  async joinWaitlist(productId: string, userId: string, nowMs: number): Promise<{ result: JoinResult; position: number }> {
+    const [result, position] = await this.r.flashJoinWaitlist(keys.stock(productId), keys.user(productId, userId), keys.waitlist(productId), userId, nowMs);
+    return { result: result as JoinResult, position: Number(position) };
   }
 
   markPaid(productId: string, reservationId: string): Promise<string> {

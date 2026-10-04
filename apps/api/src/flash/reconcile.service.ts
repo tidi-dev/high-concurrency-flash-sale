@@ -7,6 +7,7 @@ import { QueueService } from '../common/queue.service';
 import { REDIS } from '../common/redis';
 import { TelemetryService } from '../common/telemetry.service';
 import { ReservationScripts } from './redis-scripts';
+import { isFreed, WaitlistService } from './waitlist.service';
 
 const PRODUCT = PRODUCTS.flash.id;
 const LIVE_JOB_STATES = new Set(['waiting', 'active', 'delayed', 'prioritized', 'waiting-children']);
@@ -49,6 +50,7 @@ export class ReconcileService {
     private readonly queue: QueueService,
     private readonly telemetry: TelemetryService,
     @Inject(REDIS) private readonly redis: Redis,
+    private readonly waitlist: WaitlistService,
   ) {}
 
   /** redisStock - (dbStock - pending - expiredNotYetReleasedToRedis). 0 = consistent. */
@@ -81,7 +83,8 @@ export class ReconcileService {
       if (await this.prisma.reservation.findUnique({ where: { id: rid }, select: { id: true } })) continue;
       const hash = await this.redis.hgetall(keys.reservation(PRODUCT, rid));
       const userId = hash.userId ?? '';
-      const outcome = await this.scripts.releaseOrphan(PRODUCT, rid, userId, cutoff);
+      const handoff = await this.waitlist.newHandoff();
+      const outcome = await this.scripts.releaseOrphan(PRODUCT, rid, userId, cutoff, handoff);
       if (outcome === 'CONFIRMED') {
         // The worker confirmed it (so we may NOT release the unit) but its job is gone: failed after
         // all retries, or lost. Re-publish the message; the worker is idempotent, so this is safe
@@ -102,12 +105,19 @@ export class ReconcileService {
           { type: 'REDRIVEN', mode: 'flash', reservationId: rid, userId, detail: 'confirmed by the worker but its job died; message re-published' },
           { hash: keys.flashMetrics, incr: { redriven: 1 } },
         );
-      } else if (outcome === 'RELEASED') {
+      } else if (isFreed(outcome)) {
         orphansReleased++;
         await this.telemetry.record(
-          { type: 'ORPHAN_RELEASED', mode: 'flash', reservationId: rid, userId, detail: 'admitted by Redis but never queued; unit returned' },
+          {
+            type: 'ORPHAN_RELEASED',
+            mode: 'flash',
+            reservationId: rid,
+            userId,
+            detail: `admitted by Redis but never queued; unit ${outcome === 'RELEASED' ? 'returned to stock' : 'handed to the first shopper on the waitlist'}`,
+          },
           { hash: keys.flashMetrics, incr: { orphansReleased: 1 } },
         );
+        await this.waitlist.afterRelease(PRODUCT, outcome, handoff);
       }
     }
 

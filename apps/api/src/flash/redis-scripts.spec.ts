@@ -180,6 +180,83 @@ describe('Redis reservation scripts', () => {
     });
   });
 
+  describe('waitlist', () => {
+    const join = (userId: string, now = Date.now()) => scripts.joinWaitlist(productId, userId, now);
+
+    it('refuses to queue people while stock is still available (just buy)', async () => {
+      await seed(1);
+      expect(await join('u1')).toEqual({ result: 'STOCK_AVAILABLE', position: 0 });
+      expect(await redis.zcard(keys.waitlist(productId))).toBe(0);
+    });
+
+    it('queues sold-out shoppers in arrival order, once each', async () => {
+      await seed(0);
+      expect(await join('u1', 1000)).toEqual({ result: 'WAITING', position: 1 });
+      expect(await join('u2', 2000)).toEqual({ result: 'WAITING', position: 2 });
+      expect(await join('u1', 3000)).toEqual({ result: 'WAITING', position: 1 }); // joining again keeps your place
+    });
+
+    it('refuses a shopper who already holds a reservation', async () => {
+      await seed(1);
+      await reserve('u1', 'r1');
+      expect(await join('u1')).toEqual({ result: 'ALREADY_RESERVED', position: 0 });
+    });
+
+    it('a released unit goes to the FIRST person in line, atomically, never back to the public', async () => {
+      await seed(1);
+      await reserve('u1', 'r1');
+      await join('w1', 1000);
+      await join('w2', 2000);
+
+      const out = await scripts.release(productId, 'r1', 'u1', 'EXPIRED', { reservationId: 'r-w1', nowMs: 5000, expiresAtMs: 35000 });
+
+      expect(out).toBe('HANDED_OFF:w1');
+      expect(await redis.get(keys.stock(productId))).toBe('0'); // a random buyer can't snipe it
+      expect(await redis.hgetall(keys.reservation(productId, 'r-w1'))).toMatchObject({
+        status: 'RESERVED',
+        userId: 'w1',
+        expiresAt: '35000',
+        saleId: 'sale-1',
+        via: 'waitlist',
+      });
+      expect(await redis.get(keys.user(productId, 'w1'))).toBe('r-w1');
+      expect(await redis.zscore(keys.pending(productId), 'r-w1')).toBe('5000');
+      expect(await redis.zrange(keys.waitlist(productId), 0, -1)).toEqual(['w2']);
+    });
+
+    it('skips waitlisted shoppers who meanwhile got a unit another way', async () => {
+      await seed(2);
+      await reserve('u1', 'r1');
+      await reserve('w1', 'r2'); // w1 joined earlier, then bought normally... (stale entry)
+      await redis.zadd(keys.waitlist(productId), 1, 'w1', 2, 'w2');
+
+      expect(await scripts.release(productId, 'r1', 'u1', 'EXPIRED', { reservationId: 'r-w', nowMs: 5000, expiresAtMs: 35000 })).toBe('HANDED_OFF:w2');
+    });
+
+    it('with an empty waitlist the unit goes back to the public stock as before', async () => {
+      await seed(1);
+      await reserve('u1', 'r1');
+      expect(await scripts.release(productId, 'r1', 'u1', 'EXPIRED')).toBe('RELEASED');
+      expect(await redis.get(keys.stock(productId))).toBe('1');
+    });
+
+    it('the orphan reconciler hands off too', async () => {
+      await seed(1);
+      await reserve('u1', 'r1', 1000);
+      await join('w1', 1500);
+      expect(await scripts.releaseOrphan(productId, 'r1', 'u1', 5000, { reservationId: 'r-w1', nowMs: 6000, expiresAtMs: 36000 })).toBe('HANDED_OFF:w1');
+      expect(await redis.get(keys.stock(productId))).toBe('0');
+    });
+
+    it('a normal successful buy removes the buyer from the waitlist', async () => {
+      await seed(0);
+      await join('w1');
+      await redis.set(keys.stock(productId), 1); // a unit appears (e.g. stock overwrite)
+      await reserve('w1', 'r1');
+      expect(await redis.zcard(keys.waitlist(productId))).toBe(0);
+    });
+  });
+
   describe('releaseOrphan (reconciler)', () => {
     it('releases an unconfirmed reservation older than the cutoff', async () => {
       await seed(1);

@@ -17,6 +17,12 @@ export const keys = {
   user: (productId: string, userId: string) => `flash:{${productId}}:user:${userId}`,
   /** zset: reservationId -> createdAt ms. Admitted by Redis, not yet confirmed by the worker. */
   pending: (productId: string) => `flash:{${productId}}:pending`,
+  /** zset: userId -> join time ms. Sold-out shoppers waiting for a unit to come back (first come, first served). */
+  waitlist: (productId: string) => `flash:{${productId}}:waitlist`,
+  /** Prefix of the per-user key, for Lua scripts that only learn the user id while running (same hash tag, same slot). */
+  userPrefix: (productId: string) => `flash:{${productId}}:user:`,
+  /** hash: the reservation a waitlisted user was handed (reservationId, expiresAt, offeredAt). Their "notification". */
+  notice: (productId: string, userId: string) => `flash:{${productId}}:notice:${userId}`,
   /** string: id of the current sale (fencing token, mirrors Product.saleId in PostgreSQL). */
   sale: (productId: string) => `flash:{${productId}}:sale`,
   productPattern: (productId: string) => `flash:{${productId}}:*`,

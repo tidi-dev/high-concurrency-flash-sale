@@ -54,6 +54,8 @@ export type EventType =
   | 'NAIVE_STOCK_READ'
   | 'NAIVE_ORDER_CREATED'
   | 'WORKER_PICKED'
+  | 'WAITLIST_JOINED'
+  | 'WAITLIST_OFFERED'
   | 'STORY_STARTED'
   | 'STORY_FINISHED'
   | 'NAIVE_SOLD_OUT'
@@ -158,6 +160,8 @@ export interface FlashMetrics {
   expired: number;
   released: number;
   orphansReleased: number;
+  waitlistJoined: number;
+  waitlistOffered: number;
 }
 
 export interface FlashState {
@@ -168,6 +172,8 @@ export interface FlashState {
     pending: number;
     /** Lowest value DECR ever returned (decr strategy shows negatives here). */
     minObservedStock: number | null;
+    /** Sold-out shoppers waiting for a unit to come back. */
+    waitlist: number;
   };
   db: {
     reserved: number;
@@ -238,4 +244,14 @@ export interface StoryRun {
   /** userIds of the shoppers, in arrival order. Events for them carry these userIds. */
   shoppers: string[];
   startedAt: number;
+}
+
+export interface WaitlistStatus {
+  status: 'WAITING' | 'OFFERED' | 'PAID' | 'OFFER_ENDED' | 'NONE' | 'STOCK_AVAILABLE' | 'ALREADY_RESERVED' | 'NOT_INITIALIZED';
+  /** 1-based place in line (WAITING). */
+  position?: number;
+  /** The reservation held for this shopper (OFFERED / PAID / OFFER_ENDED). */
+  reservationId?: string;
+  expiresAt?: number;
+  message: string;
 }

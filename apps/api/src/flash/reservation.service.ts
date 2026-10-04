@@ -106,7 +106,7 @@ export class ReservationService {
 
 const MESSAGES: Record<'ALLOWED' | 'SOLD_OUT' | 'ALREADY_RESERVED' | 'NOT_INITIALIZED', (ttl: number) => string> = {
   ALLOWED: (ttl: number) => `Reserved for ${ttl} seconds. Complete payment before the reservation expires.`,
-  SOLD_OUT: () => 'Sold out.',
+  SOLD_OUT: () => 'Sold out. Join the waitlist: if a sneaker comes back (an unpaid reservation expires), it is held for the first person in line.',
   ALREADY_RESERVED: () => 'You already hold a reservation for this product (see reservationId).',
   NOT_INITIALIZED: () => 'Sale not initialized: the Redis stock key does not exist (reset the demo).',
 };

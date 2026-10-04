@@ -12,7 +12,7 @@ import { SimulationService } from './simulation.service';
 const NAIVE_FIELDS: (keyof NaiveMetrics)[] = ['requests', 'success', 'soldOut', 'errors', 'dbQueries', 'raceWindow', 'raceWindowPeak'];
 const FLASH_FIELDS: (keyof FlashMetrics)[] = [
   'requests', 'allowed', 'soldOut', 'alreadyReserved', 'errors', 'queued', 'enqueueFailed', 'compensations',
-  'confirmed', 'persisted', 'duplicatesIgnored', 'rejected', 'staleDropped', 'redriven', 'paid', 'expired', 'released', 'orphansReleased',
+  'confirmed', 'persisted', 'duplicatesIgnored', 'rejected', 'staleDropped', 'redriven', 'paid', 'expired', 'released', 'orphansReleased', 'waitlistJoined', 'waitlistOffered',
 ];
 
 function numbers<K extends string>(hash: Record<string, string>, fields: K[]): Record<K, number> {
@@ -88,11 +88,12 @@ export class StateService {
 
   private async flash(config: DemoConfig): Promise<FlashState> {
     const id = PRODUCTS.flash.id;
-    const [product, rawStock, pending, metricsHash, byStatus, ordersByStatus, expiredNotReleased, jobCounts, paused, drift, lastRun] =
+    const [product, rawStock, pending, waitlist, metricsHash, byStatus, ordersByStatus, expiredNotReleased, jobCounts, paused, drift, lastRun] =
       await Promise.all([
         this.prisma.product.findUnique({ where: { id } }),
         this.redis.get(keys.stock(id)),
         this.redis.zcard(keys.pending(id)),
+        this.redis.zcard(keys.waitlist(id)),
         this.redis.hgetall(keys.flashMetrics),
         this.prisma.reservation.groupBy({ by: ['status'], where: { productId: id }, _count: { _all: true } }),
         this.prisma.order.groupBy({ by: ['status'], where: { productId: id }, _count: { _all: true } }),
@@ -191,7 +192,7 @@ export class StateService {
 
     return {
       product: product && { id: product.id, name: product.name, initialStock: product.initialStock, dbStock: product.stock },
-      redis: { stock: redisStock, pending, minObservedStock: minObserved },
+      redis: { stock: redisStock, pending, minObservedStock: minObserved, waitlist },
       db,
       queue,
       metrics: numbers(metricsHash, FLASH_FIELDS),

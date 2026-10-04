@@ -9,6 +9,7 @@ import { mapLimit } from '../common/util';
 import { ReservationStatus } from '../generated/prisma/enums';
 import { canTransition } from './reservation-state';
 import { ReservationScripts } from './redis-scripts';
+import { isFreed, WaitlistService } from './waitlist.service';
 
 const M = keys.flashMetrics;
 const PRODUCT = PRODUCTS.flash.id;
@@ -36,6 +37,7 @@ export class LifecycleService {
     private readonly scripts: ReservationScripts,
     private readonly telemetry: TelemetryService,
     @Inject(REDIS) private readonly redis: Redis,
+    private readonly waitlist: WaitlistService,
   ) {}
 
   async pay(reservationId: string): Promise<PayResult> {
@@ -128,9 +130,14 @@ export class LifecycleService {
     const row = await this.prisma.reservation.findUnique({ where: { id: reservationId } });
     if (!row || row.status !== 'EXPIRED' || row.redisReleasedAt) return 'NOOP';
 
-    const outcome = await this.scripts.release(row.productId, reservationId, row.userId, 'EXPIRED');
-    if (outcome === 'RELEASED') {
-      await this.telemetry.record({ type: 'STOCK_RELEASED', mode: 'flash', reservationId, userId: row.userId }, { hash: M, incr: { released: 1 } });
+    const handoff = await this.waitlist.newHandoff();
+    const outcome = await this.scripts.release(row.productId, reservationId, row.userId, 'EXPIRED', handoff);
+    if (isFreed(outcome)) {
+      await this.telemetry.record(
+        { type: 'STOCK_RELEASED', mode: 'flash', reservationId, userId: row.userId, detail: outcome === 'RELEASED' ? 'back in stock' : 'handed to the first shopper on the waitlist' },
+        { hash: M, incr: { released: 1 } },
+      );
+      await this.waitlist.afterRelease(row.productId, outcome, handoff);
     } else if (outcome === 'MISSING') {
       await this.telemetry.record({
         type: 'STOCK_RELEASE_SKIPPED',
@@ -165,7 +172,7 @@ export class LifecycleService {
     const released = await mapLimit(unreleased, 10, (r) => this.releaseToRedis(r.id));
     return {
       expired: results.filter((r) => r.expired).length,
-      released: [...results.map((r) => r.redis), ...released].filter((o) => o === 'RELEASED').length,
+      released: [...results.map((r) => r.redis ?? ''), ...released].filter(isFreed).length,
     };
   }
 

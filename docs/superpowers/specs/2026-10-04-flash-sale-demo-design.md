@@ -238,3 +238,18 @@ Design: the dashboard has two tabs. **🎬 Story mode** is the default and **�
 - Pacing knobs are restored when the story ends. Starting a story resets the demo data.
 - The UI animates shopper avatars between zones, driven by per-shopper events (`NAIVE_STOCK_READ`, `NAIVE_ORDER_CREATED`, `RESERVATION_ALLOWED`, `SOLD_OUT`, `ORDER_QUEUED`, `WORKER_PICKED`, `ORDER_CREATED`) streamed over SSE. A narration bar explains each phase in plain language, and a collapsible legend maps the metaphors to the tech: shelf = DB row, ticket desk = Redis, waiting line = queue, clerk = worker, order book = PostgreSQL.
 - **Step-by-step playback** (second round of feedback): the UI records each real event as a *frame* (scene + counts + a one-sentence caption + the shopper it's about). The viewer moves through frames with ⏮ / ◀ Previous / ▶ Play · ⏸ Pause · ↺ Replay / Next ▶ / ⏭, a scrubber, or ← → and space. "Auto-play" advances one frame every 1.1 s (1.9 s at "very slow"); "Step by step" waits for clicks. Frames carry real numbers from the events themselves (`NAIVE_ORDER_CREATED` detail includes `stock now N`, `RESERVATION_ALLOWED` detail includes `N left`), so stepping backwards shows the counts as they were.
+
+## 16. Waitlist (added 2026-10-04)
+
+Request: sold-out shoppers should be notified when a unit comes back.
+
+Decision: **hand-off, not notify-and-race.** A freed unit (expiry or orphan release) is given to the first shopper in `flash:{p}:waitlist` (zset by join time) *inside the same release script*. Only with an empty waitlist does it go back to the public stock. Notify-and-race was rejected: it recreates a mini-stampede and lets non-waitlisted buyers snipe the unit.
+
+- **Scripts:** `JOIN_WAITLIST_LUA` (refuses with `STOCK_AVAILABLE` / `ALREADY_RESERVED` / `NOT_INITIALIZED`; ZADD NX keeps your place). `GIVE_BACK_LUA` is shared by `RELEASE_LUA` and `RELEASE_ORPHAN_LUA` (now 7 KEYS). It ZPOPMINs, skips users who already hold a unit, then creates the reservation hash (`via=waitlist`), the user key and the pending entry for a caller-chosen reservation id. Return value is `RELEASED` or `HANDED_OFF:<userId>`. `RESERVE_LUA` ZREMs a successful buyer from the waitlist (6 KEYS). The next user's key is built inside the script from the product's hash-tag prefix: same slot, so it's Cluster-safe, a documented exception to "declare all keys".
+- **`WaitlistService`:** `newHandoff()` (id + TTL from config), `afterRelease()` (publish the queue message, write the `flash:{p}:notice:<userId>` hash, `WAITLIST_OFFERED` event, `waitlistOffered` metric), `join`, `leave`, `status` (`WAITING #n` / `OFFERED` / `PAID` / `OFFER_ENDED` / `NONE`).
+- **Crash after the hand-off, before publishing:** the reservation is an ordinary orphan, and the reconciler releases it to the next in line.
+- **Accounting:** the expiry DB transaction returns the unit to `Product.stock` (+1), and persisting the handed-off reservation takes it again (−1). Redis stock is untouched. Drift and conservation hold (tested).
+- **API:** `POST /api/flash-sale/waitlist {userId}`, `GET|DELETE /api/flash-sale/waitlist/:userId`. Snapshot gains `flash.redis.waitlist`, and metrics gain `waitlistJoined` / `waitlistOffered`.
+- **UI:** Lab → Try it yourself shows "🔔 Join waitlist" after SOLD_OUT, then a live status card (polls every 1.5 s) that becomes a green "held for you" card with a countdown and Pay button, plus a toast. The Redis pipeline node shows the waitlist length.
+- **Tests:** 8 script tests, 5 integration tests (hand-off on expiry, no sniping, offer moves on when unpaid, join refusals, crash-after-hand-off healed by reconcile).
+- **Not built (production):** real push/email/SMS, waitlist size limits and entry expiry, and Story-mode visualization of the waitlist.

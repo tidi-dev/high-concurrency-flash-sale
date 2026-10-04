@@ -54,6 +54,8 @@ export function FlashPanel({ s, rates }: { s: StateSnapshot; rates: Rates }) {
               <b>{fmt(f.redis.pending)}</b>
             </div>
           </div>
+          <Stat label="🔔 waitlist (sold-out shoppers waiting)" value={fmt(f.redis.waitlist)} />
+          {m.waitlistOffered > 0 && <Stat label="units handed to the waitlist" value={fmt(m.waitlistOffered)} tone="ok" />}
           {s.config.reserveStrategy === 'decr' && <Stat label="DECR went negative → INCR back" value={fmt(m.compensations)} />}
           {redisNegative && <Stat label="lowest value DECR returned" value={fmt(f.redis.minObservedStock)} tone="warn" />}
         </Node>

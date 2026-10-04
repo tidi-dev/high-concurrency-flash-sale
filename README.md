@@ -149,7 +149,28 @@ stateDiagram-v2
 - Every transition is a **conditional update** (`WHERE status = 'RESERVED'`). Concurrent or duplicate expiry returns stock exactly once, and pay-vs-expire has exactly one winner (both are tested).
 - Expiry is two steps (DB transaction, then the idempotent Redis release). `redisReleasedAt` lets the sweeper finish step 2 after a crash.
 
-APIs: `POST /api/flash-sale/buy` · `GET /api/flash-sale/reservations/:id` (Redis vs DB view) · `POST …/:id/pay` · `POST …/:id/expire` · `POST …/:id/release` · `POST /api/flash-sale/expire-due` · `POST /api/flash-sale/pay-random`.
+APIs: `POST /api/flash-sale/buy` · `GET /api/flash-sale/reservations/:id` (Redis vs DB view) · `POST …/:id/pay` · `POST …/:id/expire` · `POST …/:id/release` · `POST /api/flash-sale/expire-due` · `POST /api/flash-sale/pay-random` · `POST /api/flash-sale/waitlist` · `GET|DELETE /api/flash-sale/waitlist/:userId`.
+
+## Waitlist: what happens to sold-out shoppers
+
+"Sold out" isn't always final: a reservation can expire unpaid, or the reconciler can free a leaked unit. A sold-out shopper can **join the waitlist** (`POST /api/flash-sale/waitlist {userId}`), and when a unit comes back it is **handed to the first person in line**:
+
+```mermaid
+sequenceDiagram
+    participant A as Alice (holds the last unit)
+    participant R as Redis
+    participant B as Bob (sold out, #1 on waitlist)
+    A--xR: doesn't pay in time
+    Note over R: one atomic script: expire Alice's hold,<br/>pop Bob from the waitlist,<br/>create a reservation for him
+    R-->>B: "a sneaker came back: it's held for you, pay within 30 s"
+    Note over R: the unit never re-entered the public stock,<br/>so nobody could snipe it in between
+```
+
+- **Fair and snipe-proof:** release and hand-off happen in the *same* Lua script, so the unit never sits in the public stock. If nobody is waiting, it goes back on sale as before.
+- **Same pipeline:** the held reservation goes through pending → queue → worker → PostgreSQL like any other. If the process dies right after the hand-off, it's an ordinary orphan: the reconciler releases it to the *next* person in line.
+- **Unpaid offers move on:** if Bob doesn't pay in time, his hold expires and goes to the next shopper.
+- **"Notification" in this demo** is a `WAITLIST_OFFERED` event plus `GET /api/flash-sale/waitlist/:userId` (`WAITING #n` → `OFFERED` → `PAID` / `OFFER_ENDED`), which the dashboard polls. Production would send a push notification, email or SMS.
+- **Try it:** Lab tab → *Try it yourself* → buy as one user, switch the userId, buy again (sold out) → **🔔 Join waitlist** → press **expire** on the first reservation → the green "held for you" card appears.
 
 ## Failure scenarios
 

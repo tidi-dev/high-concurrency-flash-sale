@@ -1,5 +1,5 @@
-import type { BuyResponse, ReservationView } from '@flash/shared';
-import { useEffect, useState } from 'react';
+import type { BuyResponse, ReservationView, WaitlistStatus } from '@flash/shared';
+import { useEffect, useRef, useState } from 'react';
 import { api, post } from '../api';
 
 function Countdown({ until }: { until: number | null }) {
@@ -37,7 +37,42 @@ export function TryIt({ notify }: { notify: (msg: string, tone?: 'ok' | 'danger'
     };
   }, []);
 
+  // Waitlist: after joining, poll our status. (A real app would get a push notification instead.)
+  const [wait, setWait] = useState<WaitlistStatus | null>(null);
+  const lastWaitStatus = useRef<string | null>(null);
+  const waitingFor = wait && ['WAITING', 'OFFERED'].includes(wait.status) ? userId : null;
+  useEffect(() => {
+    if (!waitingFor) return;
+    let alive = true;
+    const t = setInterval(async () => {
+      const r = await api<WaitlistStatus>(`/flash-sale/waitlist/${encodeURIComponent(waitingFor)}`);
+      if (!alive || r.status !== 200) return;
+      // Side effects stay outside state updaters (React may run updaters twice in development).
+      if (lastWaitStatus.current !== 'OFFERED' && r.data.status === 'OFFERED') {
+        notify('🎉 A sneaker came back and is held for you. Pay before the timer runs out!');
+      }
+      lastWaitStatus.current = r.data.status;
+      setWait(r.data);
+    }, 1500);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [waitingFor, notify]);
+
+  const joinWaitlist = async () => {
+    const r = await post<WaitlistStatus>('/flash-sale/waitlist', { userId });
+    lastWaitStatus.current = r.data.status;
+    setWait(r.data);
+    if (r.data.status !== 'WAITING') notify(r.data.message, 'danger');
+  };
+  const leaveWaitlist = async () => {
+    await api(`/flash-sale/waitlist/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+    setWait(null);
+  };
+
   const buy = async () => {
+    setWait(null);
     const r = await post<BuyResponse>('/flash-sale/buy', { userId });
     setLast({ code: r.status, body: r.data });
     if (r.data.reservationId) void doInspect(r.data.reservationId);
@@ -81,11 +116,50 @@ export function TryIt({ notify }: { notify: (msg: string, tone?: 'ok' | 'danger'
                 <Countdown until={last.body.expiresAt} />
               ))}
           </div>
+          {last.body.status === 'SOLD_OUT' && !wait && (
+            <div className="row gap">
+              <button className="btn btn-primary" onClick={joinWaitlist}>🔔 Join waitlist</button>
+              <span className="small muted">If someone doesn't pay in time, their sneaker is held for the first person in line.</span>
+            </div>
+          )}
           {last.body.reservationId && (
             <div className="row gap">
               <button className="btn" onClick={() => pay(last.body.reservationId!)}>💳 Pay</button>
               <button className="btn" onClick={() => expire(last.body.reservationId!)}>⏱ Expire now</button>
               <button className="btn" onClick={() => doInspect(last.body.reservationId!)}>🔍 Inspect</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {wait && wait.status !== 'NONE' && (
+        <div className={`waitcard wait-${wait.status}`}>
+          <div className="wait-head">
+            <span className="wait-icon">{wait.status === 'OFFERED' ? '🎉' : wait.status === 'PAID' ? '✅' : wait.status === 'OFFER_ENDED' ? '⌛' : '🔔'}</span>
+            <div>
+              <b>
+                {wait.status === 'WAITING' && <>Waitlist: you're #{wait.position} in line</>}
+                {wait.status === 'OFFERED' && <>A sneaker came back: it's held for you!</>}
+                {wait.status === 'PAID' && <>Paid. The sneaker is yours.</>}
+                {wait.status === 'OFFER_ENDED' && <>Your held sneaker went to the next person in line</>}
+                {!['WAITING', 'OFFERED', 'PAID', 'OFFER_ENDED'].includes(wait.status) && wait.status}
+              </b>
+              <div className="small">{wait.message}</div>
+            </div>
+            {wait.status === 'OFFERED' && <Countdown until={wait.expiresAt ?? null} />}
+          </div>
+          {wait.status === 'WAITING' && (
+            <div className="row gap">
+              <span className="small muted">
+                Waiting for a notification… To see it happen, expire someone's reservation (the "expire" button below, or let its timer run out).
+              </span>
+              <button className="btn btn-xs" onClick={leaveWaitlist}>leave</button>
+            </div>
+          )}
+          {wait.status === 'OFFERED' && wait.reservationId && (
+            <div className="row gap">
+              <button className="btn btn-primary" onClick={() => pay(wait.reservationId!)}>💳 Pay now</button>
+              <button className="btn" onClick={() => doInspect(wait.reservationId!)}>🔍 Inspect</button>
             </div>
           )}
         </div>

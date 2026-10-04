@@ -209,12 +209,42 @@ With the Lua strategy, the reserve script refuses a user who already has a `flas
 
 Limits, honestly: the rule lives **only in Redis**. The `decr` strategy has no per-user limit at all, and a Redis data loss forgets who held what. Production would add a database guard, for example a partial unique index such as `UNIQUE (productId, userId) WHERE status IN ('RESERVED','PAID')` (Prisma can't express that without raw SQL, which is why the demo skips it), plus identity and bot checks, because one person with 1,000 accounts defeats any per-user rule.
 
+## The waitlist: where a returned unit goes
+
+When a reservation expires (or the reconciler frees a leaked unit), the unit is free again. Who gets it?
+
+- **Naive answer:** put it back in the stock. Then whoever happens to retry fastest grabs it, often a bot hammering "Buy", not the person who was told "sold out" first.
+- **What the demo does:** sold-out shoppers can join a **waitlist**, a Redis sorted set ordered by join time (`flash:{flash-sneaker}:waitlist`). The release scripts (`RELEASE_LUA` and `RELEASE_ORPHAN_LUA` in `apps/api/src/flash/redis-scripts.ts`) end with a shared `giveBack` step:
+
+```lua
+local popped = redis.call('ZPOPMIN', waitKey)        -- first in line
+-- (skip anyone who meanwhile got a unit another way)
+redis.call('HSET', newResKey, 'status', 'RESERVED', 'userId', nextUser, ... 'via', 'waitlist')
+redis.call('SET', nextUserKey, newRid)                -- one-per-user rule still holds
+redis.call('ZADD', pendingKey, nowMs, newRid)         -- "admitted but not yet persisted"
+-- only if nobody is waiting:
+redis.call('INCR', stockKey)
+```
+
+The important property is **atomicity**. If we first INCR'd the stock and *then* tried to hand the unit to the waitlist, a random buyer could take it in between. Inside one script there is no "in between".
+
+After the script, `WaitlistService.afterRelease` (`apps/api/src/flash/waitlist.service.ts`) publishes the new reservation's queue message, so it is persisted like any other, and writes a **notice** for the shopper. That's the demo's stand-in for a push notification: `GET /api/flash-sale/waitlist/:userId` answers `WAITING` (with your place in line), `OFFERED` (with the reservation and its deadline), `PAID` or `OFFER_ENDED`.
+
+What happens when things go wrong:
+- **The held shopper doesn't pay:** the hold expires like any reservation, and the release hands it to the *next* person in line.
+- **The process dies after the hand-off but before publishing:** the held reservation is in `pending` with no queue job, which is exactly an orphan. The reconciler releases it, and the release hands it to the next person in line. Nothing is lost. The integration test `test/waitlist.int-spec.ts` covers this.
+- **Joining is only allowed when it makes sense:** the join script refuses while stock is still available ("just buy") or while you already hold a reservation. Joining twice keeps your original place, and a successful normal buy removes you from the list.
+
+**Demo vs production:** in production you'd add real notifications (push, email, SMS), a limit on waitlist size, an expiry for stale waitlist entries, and probably a shorter pay window for offers. The waitlist also lives in Redis, so a Redis data loss loses it (see [failure modes](07-failure-modes.md)).
+
 ## The API
 
 All under `/api/flash-sale` ([`flash.controller.ts`](../apps/api/src/flash/flash.controller.ts)):
 
 | Method & path | What it does | Responses |
 |---|---|---|
+| `POST /waitlist` `{userId}` | join the waitlist (only when sold out) | `WAITING` + position, `STOCK_AVAILABLE`, `ALREADY_RESERVED` |
+| `GET /waitlist/:userId` | the "notification" | `WAITING`, `OFFERED` (+ reservationId, expiresAt), `PAID`, `OFFER_ENDED`, `NONE` |
 | `POST /buy` `{userId}` | Redis reserve + enqueue | `202 RESERVED`, `409 SOLD_OUT`, `409 ALREADY_RESERVED` (body includes the `reservationId` you already hold), `503 NOT_INITIALIZED`, `500 SIMULATED_CRASH` |
 | `GET /reservations/:id` | Both views side by side: the Redis hash and the PostgreSQL row + order (`persisted: true/false`) | `200`, `404` |
 | `GET /reservations?limit=20` | Most recent reservations from PostgreSQL | `200` |

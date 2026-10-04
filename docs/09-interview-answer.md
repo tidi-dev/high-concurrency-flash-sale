@@ -193,6 +193,9 @@ Yes. It's a blind `SET` racing live decrements: read 10 from the database, a buy
 **17. "What if a message from before a restart arrives after it?"**
 Say the sale is reset, or Redis is rebuilt, while a buy is in flight or a worker is still running. The old message reaches the worker after the new sale has started. The primary key doesn't help: the new sale has no row with that id, so it isn't a "duplicate". The fix is a **fencing token**: every sale (or rebuild) gets a new id, every message carries the id it was admitted under, and the database write checks it (`UPDATE ... WHERE id = ? AND sale_id = ? AND stock > 0`). An old token changes 0 rows, the transaction rolls back, and the message is dropped. It's the same idea as Kafka's epochs, ZooKeeper's `zxid` and fenced leases: the resource being written to rejects work from an older generation, because the sender can't reliably know it's stale. *(Demo: a message admitted before a reset and re-published after it comes back `STALE`, with no row written and drift 0.)*
 
+**18. "Someone was told 'sold out', then a reservation expired. Who gets that unit?"**
+Not "whoever retries fastest": that rewards bots and hammering. Keep a waitlist (a Redis sorted set by join time), and when a unit is freed, hand it to the first person in line *in the same atomic script that frees it*. Then it never sits in the public stock where it could be sniped. The handed-off unit becomes a normal reservation with its own TTL: notify the shopper (push, email, SMS), and if they don't pay, it moves to the next in line. If the process dies between the hand-off and publishing its message, it's just an orphan, and the reconciler passes it on. *(Demo: `test/waitlist.int-spec.ts`; Lab → Try it yourself → 🔔 Join waitlist.)*
+
 ---
 
 ## Mistakes to avoid

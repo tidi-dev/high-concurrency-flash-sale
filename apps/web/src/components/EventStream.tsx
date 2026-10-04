@@ -5,6 +5,8 @@ const TONE: Partial<Record<DemoEvent['type'], string>> = {
   RESERVATION_ALLOWED: 'ok',
   ORDER_CREATED: 'ok',
   PAYMENT_COMPLETED: 'ok',
+  WAITLIST_OFFERED: 'ok',
+  WAITLIST_JOINED: 'info',
   NAIVE_ORDER_CREATED: 'ok',
   SOLD_OUT: 'muted',
   NAIVE_SOLD_OUT: 'muted',
